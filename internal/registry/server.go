@@ -2,7 +2,7 @@ package registry
 
 import (
 	"context"
-	"strings"
+	"errors"
 	"sync"
 	"time"
 
@@ -19,15 +19,11 @@ import (
 const heartbeatTimeout = 30 * time.Second
 
 // Server implements the RegistryService gRPC server.
-// MVP: in-memory store. Swap to PostgreSQL + Redis for production.
 type Server struct {
 	computev1.UnimplementedRegistryServiceServer
 
-	mu        sync.RWMutex
-	providers map[string]*computev1.Provider
-	sessions  map[string]*computev1.Session
-
-	// NAT traversal state: sessionID -> peerID -> candidateSet
+	// NAT traversal state: sessionID -> peerID -> candidateSet (always in-memory)
+	mu         sync.RWMutex
 	candidates map[string]map[string]*candidateSet
 
 	relay   *relay.RelayServer
@@ -49,8 +45,6 @@ func WithPlugins(b *plugin.Bundle) Option {
 
 func NewServer(relayServer *relay.RelayServer, opts ...Option) *Server {
 	s := &Server{
-		providers:  make(map[string]*computev1.Provider),
-		sessions:   make(map[string]*computev1.Session),
 		candidates: make(map[string]map[string]*candidateSet),
 		relay:      relayServer,
 		plugins:    plugin.Defaults(),
@@ -61,243 +55,279 @@ func NewServer(relayServer *relay.RelayServer, opts ...Option) *Server {
 	return s
 }
 
-// resolveProvider finds a provider by full ID or unique prefix.
-func (s *Server) resolveProvider(prefix string) (*computev1.Provider, error) {
-	if p, ok := s.providers[prefix]; ok {
-		return p, nil
+// ── Conversions ────────────────────────────────────────────────────
+
+func providerToProto(r *plugin.ProviderRecord) *computev1.Provider {
+	return &computev1.Provider{
+		Id:      r.ID,
+		Name:    r.Name,
+		Address: r.Address,
+		Capacity: &computev1.Resources{
+			CpuCores: r.CPUCores,
+			MemoryMb: r.MemoryMB,
+			DiskGb:   r.DiskGB,
+			GpuCount: r.GPUCount,
+			GpuModel: r.GPUModel,
+		},
+		Available: &computev1.Resources{
+			CpuCores: r.AvailCPU,
+			MemoryMb: r.AvailMemoryMB,
+			GpuCount: r.AvailGPU,
+		},
+		Status:        r.Status,
+		LastHeartbeat: timestamppb.New(time.Unix(r.LastHeartbeat, 0)),
+		RegisteredAt:  timestamppb.New(time.Unix(r.RegisteredAt, 0)),
+		PublicAddress: r.PublicAddress,
 	}
-	var match *computev1.Provider
-	for id, p := range s.providers {
-		if strings.HasPrefix(id, prefix) {
-			if match != nil {
-				return nil, status.Error(codes.InvalidArgument, "ambiguous provider ID prefix")
-			}
-			match = p
-		}
-	}
-	if match == nil {
-		return nil, status.Error(codes.NotFound, "provider not found")
-	}
-	return match, nil
 }
 
-// resolveSession finds a session by full ID or unique prefix.
-func (s *Server) resolveSession(prefix string) (*computev1.Session, error) {
-	if sess, ok := s.sessions[prefix]; ok {
-		return sess, nil
+func sessionToProto(r *plugin.SessionRecord) *computev1.Session {
+	s := &computev1.Session{
+		Id:         r.ID,
+		ProviderId: r.ProviderID,
+		RenterId:   r.RenterID,
+		Allocated: &computev1.Resources{
+			CpuCores: r.CPUCores,
+			MemoryMb: r.MemoryMB,
+		},
+		Status:         r.Status,
+		ContainerId:    r.ContainerID,
+		SshEndpoint:    r.SSHEndpoint,
+		Image:          r.Image,
+		CreatedAt:      timestamppb.New(time.Unix(r.CreatedAt, 0)),
+		WgPublicKey:    r.WGPublicKey,
+		WgEndpoint:     r.WGEndpoint,
+		ConnectionMode: r.ConnectionMode,
+		RelayToken:     r.RelayToken,
 	}
-	var match *computev1.Session
-	for id, sess := range s.sessions {
-		if strings.HasPrefix(id, prefix) {
-			if match != nil {
-				return nil, status.Error(codes.InvalidArgument, "ambiguous session ID prefix")
-			}
-			match = sess
-		}
+	if r.TerminatedAt > 0 {
+		s.TerminatedAt = timestamppb.New(time.Unix(r.TerminatedAt, 0))
 	}
-	if match == nil {
-		return nil, status.Error(codes.NotFound, "session not found")
-	}
-	return match, nil
+	return s
 }
 
-func (s *Server) RegisterProvider(_ context.Context, req *computev1.RegisterProviderRequest) (*computev1.RegisterProviderResponse, error) {
+func storeErr(err error) error {
+	if errors.Is(err, plugin.ErrNotFound) {
+		return status.Error(codes.NotFound, "not found")
+	}
+	if errors.Is(err, plugin.ErrAmbiguousPrefix) {
+		return status.Error(codes.InvalidArgument, "ambiguous ID prefix")
+	}
+	return status.Errorf(codes.Internal, "store: %v", err)
+}
+
+// ── RPCs ───────────────────────────────────────────────────────────
+
+func (s *Server) RegisterProvider(ctx context.Context, req *computev1.RegisterProviderRequest) (*computev1.RegisterProviderResponse, error) {
 	id := uuid.NewString()
-	now := timestamppb.Now()
+	now := time.Now().Unix()
 
-	provider := &computev1.Provider{
-		Id:            id,
+	rec := &plugin.ProviderRecord{
+		ID:            id,
 		Name:          req.Name,
 		Address:       req.Address,
-		Capacity:      req.Capacity,
-		Available:     req.Capacity,
 		Status:        "online",
-		LastHeartbeat: now,
+		CPUCores:      req.Capacity.GetCpuCores(),
+		MemoryMB:      req.Capacity.GetMemoryMb(),
+		DiskGB:        req.Capacity.GetDiskGb(),
+		GPUCount:      req.Capacity.GetGpuCount(),
+		GPUModel:      req.Capacity.GetGpuModel(),
+		AvailCPU:      req.Capacity.GetCpuCores(),
+		AvailMemoryMB: req.Capacity.GetMemoryMb(),
+		AvailGPU:      req.Capacity.GetGpuCount(),
 		RegisteredAt:  now,
+		LastHeartbeat: now,
 	}
 
-	s.mu.Lock()
-	s.providers[id] = provider
-	s.mu.Unlock()
+	if err := s.plugins.Store.PutProvider(ctx, rec); err != nil {
+		return nil, storeErr(err)
+	}
 
 	return &computev1.RegisterProviderResponse{
-		Provider: provider,
+		Provider: providerToProto(rec),
 		Token:    "tok_" + id,
 	}, nil
 }
 
-func (s *Server) Heartbeat(_ context.Context, req *computev1.HeartbeatRequest) (*computev1.HeartbeatResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	p, err := s.resolveProvider(req.ProviderId)
+func (s *Server) Heartbeat(ctx context.Context, req *computev1.HeartbeatRequest) (*computev1.HeartbeatResponse, error) {
+	rec, err := s.plugins.Store.GetProviderByPrefix(ctx, req.ProviderId)
 	if err != nil {
-		return nil, err
+		return nil, storeErr(err)
 	}
 
-	p.LastHeartbeat = timestamppb.Now()
-	p.Available = req.Available
-	p.Status = "online"
+	rec.LastHeartbeat = time.Now().Unix()
+	rec.Status = "online"
+	if req.Available != nil {
+		rec.AvailCPU = req.Available.CpuCores
+		rec.AvailMemoryMB = req.Available.MemoryMb
+		rec.AvailGPU = req.Available.GpuCount
+	}
+
+	if err := s.plugins.Store.PutProvider(ctx, rec); err != nil {
+		return nil, storeErr(err)
+	}
 
 	return &computev1.HeartbeatResponse{Acknowledged: true}, nil
 }
 
-func (s *Server) ListProviders(_ context.Context, req *computev1.ListProvidersRequest) (*computev1.ListProvidersResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Server) ListProviders(ctx context.Context, req *computev1.ListProvidersRequest) (*computev1.ListProvidersResponse, error) {
+	// First get all online providers
+	records, err := s.plugins.Store.ListProviders(ctx, plugin.ProviderFilter{
+		MinCPU:    req.MinCpu,
+		MinMemory: req.MinMemoryMb,
+		MinGPU:    req.MinGpu,
+	})
+	if err != nil {
+		return nil, storeErr(err)
+	}
 
-	stale := time.Now().Add(-heartbeatTimeout)
+	stale := time.Now().Add(-heartbeatTimeout).Unix()
 	var out []*computev1.Provider
-
-	for _, p := range s.providers {
-		if p.LastHeartbeat.AsTime().Before(stale) {
-			p.Status = "offline"
-		}
-		if p.Status != "online" {
+	for _, rec := range records {
+		if rec.LastHeartbeat < stale {
+			rec.Status = "offline"
+			s.plugins.Store.PutProvider(ctx, rec)
 			continue
 		}
-		if req.MinCpu > 0 && p.Available.CpuCores < req.MinCpu {
+		if rec.Status != "online" {
 			continue
 		}
-		if req.MinMemoryMb > 0 && p.Available.MemoryMb < req.MinMemoryMb {
-			continue
-		}
-		if req.MinGpu > 0 && p.Available.GpuCount < req.MinGpu {
-			continue
-		}
-		out = append(out, p)
+		out = append(out, providerToProto(rec))
 	}
 
 	return &computev1.ListProvidersResponse{Providers: out}, nil
 }
 
 func (s *Server) CreateSession(ctx context.Context, req *computev1.CreateSessionRequest) (*computev1.CreateSessionResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	p, err := s.resolveProvider(req.ProviderId)
+	pRec, err := s.plugins.Store.GetProviderByPrefix(ctx, req.ProviderId)
 	if err != nil {
-		return nil, err
+		return nil, storeErr(err)
 	}
-	if p.Status != "online" {
+	if pRec.Status != "online" {
 		return nil, status.Error(codes.Unavailable, "provider is not online")
 	}
 
 	// Plugin: check provider reputation
-	if ok, err := s.plugins.Reputation.MeetsMinimum(ctx, p.Id, 50); err != nil || !ok {
+	if ok, err := s.plugins.Reputation.MeetsMinimum(ctx, pRec.ID, 50); err != nil || !ok {
 		return nil, status.Error(codes.Unavailable, "provider does not meet minimum reputation")
 	}
 
 	relayToken := uuid.NewString()
+	sessionID := uuid.NewString()
 
-	session := &computev1.Session{
-		Id:         uuid.NewString(),
-		ProviderId: p.Id,
-		RenterId:   req.RenterId,
-		Allocated:  req.Requested,
+	rec := &plugin.SessionRecord{
+		ID:         sessionID,
+		ProviderID: pRec.ID,
+		RenterID:   req.RenterId,
 		Image:      req.Image,
 		Status:     "pending",
-		CreatedAt:  timestamppb.Now(),
 		RelayToken: relayToken,
+		CreatedAt:  time.Now().Unix(),
+	}
+	if req.Requested != nil {
+		rec.CPUCores = req.Requested.CpuCores
+		rec.MemoryMB = req.Requested.MemoryMb
 	}
 
-	s.sessions[session.Id] = session
+	if err := s.plugins.Store.PutSession(ctx, rec); err != nil {
+		return nil, storeErr(err)
+	}
 
 	// Store renter's WG public key if provided
 	if req.WgPublicKey != "" {
-		if s.candidates[session.Id] == nil {
-			s.candidates[session.Id] = make(map[string]*candidateSet)
+		s.mu.Lock()
+		if s.candidates[sessionID] == nil {
+			s.candidates[sessionID] = make(map[string]*candidateSet)
 		}
-		s.candidates[session.Id][req.RenterId] = &candidateSet{
+		s.candidates[sessionID][req.RenterId] = &candidateSet{
 			wgPublicKey: req.WgPublicKey,
 		}
+		s.mu.Unlock()
 	}
 
-	return &computev1.CreateSessionResponse{Session: session}, nil
+	return &computev1.CreateSessionResponse{Session: sessionToProto(rec)}, nil
 }
 
-func (s *Server) GetSession(_ context.Context, req *computev1.GetSessionRequest) (*computev1.GetSessionResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	session, err := s.resolveSession(req.SessionId)
+func (s *Server) GetSession(ctx context.Context, req *computev1.GetSessionRequest) (*computev1.GetSessionResponse, error) {
+	rec, err := s.plugins.Store.GetSessionByPrefix(ctx, req.SessionId)
 	if err != nil {
-		return nil, err
+		return nil, storeErr(err)
 	}
 
-	return &computev1.GetSessionResponse{Session: session}, nil
+	return &computev1.GetSessionResponse{Session: sessionToProto(rec)}, nil
 }
 
 func (s *Server) TerminateSession(ctx context.Context, req *computev1.TerminateSessionRequest) (*computev1.TerminateSessionResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	session, err := s.resolveSession(req.SessionId)
+	rec, err := s.plugins.Store.GetSessionByPrefix(ctx, req.SessionId)
 	if err != nil {
-		return nil, err
+		return nil, storeErr(err)
 	}
 
-	session.Status = "terminated"
-	session.TerminatedAt = timestamppb.Now()
+	rec.Status = "terminated"
+	rec.TerminatedAt = time.Now().Unix()
 
-	s.plugins.Reputation.RecordOutcome(ctx, session.Id, true)
+	if err := s.plugins.Store.PutSession(ctx, rec); err != nil {
+		return nil, storeErr(err)
+	}
+
+	s.plugins.Reputation.RecordOutcome(ctx, rec.ID, true)
 
 	// Clean up relay and candidate state
-	if session.RelayToken != "" && s.relay != nil {
-		s.relay.RemoveSession(session.RelayToken)
+	if rec.RelayToken != "" && s.relay != nil {
+		s.relay.RemoveSession(rec.RelayToken)
 	}
-	delete(s.candidates, session.Id)
+	s.mu.Lock()
+	delete(s.candidates, rec.ID)
+	s.mu.Unlock()
 
 	return &computev1.TerminateSessionResponse{Success: true}, nil
 }
 
-func (s *Server) ListProviderSessions(_ context.Context, req *computev1.ListProviderSessionsRequest) (*computev1.ListProviderSessionsResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Server) ListProviderSessions(ctx context.Context, req *computev1.ListProviderSessionsRequest) (*computev1.ListProviderSessionsResponse, error) {
+	records, err := s.plugins.Store.ListSessions(ctx, plugin.SessionFilter{
+		ProviderID: req.ProviderId,
+		Status:     req.StatusFilter,
+	})
+	if err != nil {
+		return nil, storeErr(err)
+	}
 
-	var out []*computev1.Session
-	for _, sess := range s.sessions {
-		if sess.ProviderId != req.ProviderId {
-			continue
-		}
-		if req.StatusFilter != "" && sess.Status != req.StatusFilter {
-			continue
-		}
-		out = append(out, sess)
+	out := make([]*computev1.Session, len(records))
+	for i, rec := range records {
+		out[i] = sessionToProto(rec)
 	}
 
 	return &computev1.ListProviderSessionsResponse{Sessions: out}, nil
 }
 
 func (s *Server) UpdateSessionStatus(ctx context.Context, req *computev1.UpdateSessionStatusRequest) (*computev1.UpdateSessionStatusResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	session, err := s.resolveSession(req.SessionId)
+	rec, err := s.plugins.Store.GetSessionByPrefix(ctx, req.SessionId)
 	if err != nil {
-		return nil, err
+		return nil, storeErr(err)
 	}
 
-	prevStatus := session.Status
-	session.Status = req.Status
+	prevStatus := rec.Status
+	rec.Status = req.Status
 
 	if req.Status == "terminated" && prevStatus != "terminated" {
-		s.plugins.Reputation.RecordOutcome(ctx, session.Id, true)
+		s.plugins.Reputation.RecordOutcome(ctx, rec.ID, true)
+		rec.TerminatedAt = time.Now().Unix()
 	}
 	if req.ContainerId != "" {
-		session.ContainerId = req.ContainerId
+		rec.ContainerID = req.ContainerId
 	}
 	if req.SshEndpoint != "" {
-		session.SshEndpoint = req.SshEndpoint
+		rec.SSHEndpoint = req.SshEndpoint
 	}
 	if req.WgPublicKey != "" {
-		session.WgPublicKey = req.WgPublicKey
+		rec.WGPublicKey = req.WgPublicKey
 	}
 	if req.WgEndpoint != "" {
-		session.WgEndpoint = req.WgEndpoint
+		rec.WGEndpoint = req.WgEndpoint
 	}
-	if req.Status == "terminated" {
-		session.TerminatedAt = timestamppb.Now()
+
+	if err := s.plugins.Store.PutSession(ctx, rec); err != nil {
+		return nil, storeErr(err)
 	}
 
 	return &computev1.UpdateSessionStatusResponse{Success: true}, nil
@@ -305,20 +335,20 @@ func (s *Server) UpdateSessionStatus(ctx context.Context, req *computev1.UpdateS
 
 // ── NAT Traversal RPCs ─────────────────────────────────────────────
 
-func (s *Server) ExchangeCandidates(_ context.Context, req *computev1.ExchangeCandidatesRequest) (*computev1.ExchangeCandidatesResponse, error) {
+func (s *Server) ExchangeCandidates(ctx context.Context, req *computev1.ExchangeCandidatesRequest) (*computev1.ExchangeCandidatesResponse, error) {
+	rec, err := s.plugins.Store.GetSessionByPrefix(ctx, req.SessionId)
+	if err != nil {
+		return nil, storeErr(err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	session, err := s.resolveSession(req.SessionId)
-	if err != nil {
-		return nil, err
-	}
-
 	// Store this peer's candidates
-	if s.candidates[session.Id] == nil {
-		s.candidates[session.Id] = make(map[string]*candidateSet)
+	if s.candidates[rec.ID] == nil {
+		s.candidates[rec.ID] = make(map[string]*candidateSet)
 	}
-	s.candidates[session.Id][req.PeerId] = &candidateSet{
+	s.candidates[rec.ID][req.PeerId] = &candidateSet{
 		candidates:  req.Candidates,
 		wgPublicKey: req.WgPublicKey,
 	}
@@ -328,9 +358,9 @@ func (s *Server) ExchangeCandidates(_ context.Context, req *computev1.ExchangeCa
 	if s.relay != nil {
 		resp.RelayAddress = s.relay.Addr()
 	}
-	resp.RelayToken = session.RelayToken
+	resp.RelayToken = rec.RelayToken
 
-	for peerID, cs := range s.candidates[session.Id] {
+	for peerID, cs := range s.candidates[rec.ID] {
 		if peerID != req.PeerId {
 			resp.PeerCandidates = cs.candidates
 			resp.PeerWgPublicKey = cs.wgPublicKey
@@ -341,22 +371,23 @@ func (s *Server) ExchangeCandidates(_ context.Context, req *computev1.ExchangeCa
 	return resp, nil
 }
 
-func (s *Server) ReportConnectionResult(_ context.Context, req *computev1.ReportConnectionResultRequest) (*computev1.ReportConnectionResultResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	session, err := s.resolveSession(req.SessionId)
+func (s *Server) ReportConnectionResult(ctx context.Context, req *computev1.ReportConnectionResultRequest) (*computev1.ReportConnectionResultResponse, error) {
+	rec, err := s.plugins.Store.GetSessionByPrefix(ctx, req.SessionId)
 	if err != nil {
-		return nil, err
+		return nil, storeErr(err)
 	}
 
 	if req.UseRelay {
-		session.ConnectionMode = "relay"
+		rec.ConnectionMode = "relay"
 		if s.relay != nil {
-			s.relay.RegisterSession(session.RelayToken, session.Id)
+			s.relay.RegisterSession(rec.RelayToken, rec.ID)
 		}
 	} else {
-		session.ConnectionMode = "holepunch"
+		rec.ConnectionMode = "holepunch"
+	}
+
+	if err := s.plugins.Store.PutSession(ctx, rec); err != nil {
+		return nil, storeErr(err)
 	}
 
 	return &computev1.ReportConnectionResultResponse{Acknowledged: true}, nil
