@@ -197,3 +197,50 @@ func (s *Server) TerminateSession(_ context.Context, req *computev1.TerminateSes
 
 	return &computev1.TerminateSessionResponse{Success: true}, nil
 }
+
+func (s *Server) ListProviderSessions(_ context.Context, req *computev1.ListProviderSessionsRequest) (*computev1.ListProviderSessionsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []*computev1.Session
+	for _, sess := range s.sessions {
+		if sess.ProviderId != req.ProviderId {
+			continue
+		}
+		if req.StatusFilter != "" && sess.Status != req.StatusFilter {
+			continue
+		}
+		out = append(out, sess)
+	}
+
+	return &computev1.ListProviderSessionsResponse{Sessions: out}, nil
+}
+
+func (s *Server) UpdateSessionStatus(_ context.Context, req *computev1.UpdateSessionStatusRequest) (*computev1.UpdateSessionStatusResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, err := s.resolveSession(req.SessionId)
+	if err != nil {
+		return nil, err
+	}
+
+	session.Status = req.Status
+	if req.ContainerId != "" {
+		session.ContainerId = req.ContainerId
+	}
+	if req.SshEndpoint != "" {
+		session.SshEndpoint = req.SshEndpoint
+	}
+	if req.WgPublicKey != "" {
+		session.WgPublicKey = req.WgPublicKey
+	}
+	if req.WgEndpoint != "" {
+		session.WgEndpoint = req.WgEndpoint
+	}
+	if req.Status == "terminated" {
+		session.TerminatedAt = timestamppb.Now()
+	}
+
+	return &computev1.UpdateSessionStatusResponse{Success: true}, nil
+}

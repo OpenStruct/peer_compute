@@ -37,6 +37,8 @@ message Session {
   string image = 8;
   google.protobuf.Timestamp created_at = 9;
   google.protobuf.Timestamp terminated_at = 10;
+  string wg_public_key = 11;   // provider-side WireGuard public key
+  string wg_endpoint = 12;     // provider's WireGuard listen endpoint
 }
 
 // ── Requests / Responses ────────────────────────────────────────────
@@ -78,6 +80,7 @@ message CreateSessionRequest {
   string renter_id = 2;
   Resources requested = 3;
   string image = 4;
+  string wg_public_key = 5; // renter's WireGuard public key
 }
 
 message CreateSessionResponse {
@@ -100,6 +103,28 @@ message TerminateSessionResponse {
   bool success = 1;
 }
 
+message ListProviderSessionsRequest {
+  string provider_id = 1;
+  string status_filter = 2; // e.g. "pending", "running"
+}
+
+message ListProviderSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message UpdateSessionStatusRequest {
+  string session_id = 1;
+  string status = 2;
+  string container_id = 3;
+  string ssh_endpoint = 4;
+  string wg_public_key = 5;
+  string wg_endpoint = 6;
+}
+
+message UpdateSessionStatusResponse {
+  bool success = 1;
+}
+
 // ── Services ────────────────────────────────────────────────────────
 
 service RegistryService {
@@ -112,4 +137,8 @@ service RegistryService {
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc TerminateSession(TerminateSessionRequest) returns (TerminateSessionResponse);
+
+  // Agent-facing RPCs
+  rpc ListProviderSessions(ListProviderSessionsRequest) returns (ListProviderSessionsResponse);
+  rpc UpdateSessionStatus(UpdateSessionStatusRequest) returns (UpdateSessionStatusResponse);
 }
