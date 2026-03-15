@@ -11,7 +11,7 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
-// WireGuard key pair for tunnel endpoints.
+// WGKeyPair holds a WireGuard Curve25519 key pair.
 type WGKeyPair struct {
 	PrivateKey string // base64-encoded
 	PublicKey  string // base64-encoded
@@ -48,14 +48,20 @@ ListenPort = {{.ListenPort}}
 [Peer]
 PublicKey = {{.PeerPublicKey}}
 AllowedIPs = {{.PeerIP}}/32
+{{- if .PeerEndpoint}}
+Endpoint = {{.PeerEndpoint}}
+{{- end}}
+PersistentKeepalive = 25
 `
 
+// WGConfig holds the parameters for generating a wg-quick config file.
 type WGConfig struct {
 	PrivateKey    string
 	TunnelIP      string // e.g. 10.99.0.1
 	ListenPort    int
 	PeerPublicKey string
 	PeerIP        string // e.g. 10.99.0.2
+	PeerEndpoint  string // e.g. 1.2.3.4:51820, or 127.0.0.1:proxyPort for relay
 }
 
 // WriteConfig writes a wg-quick compatible config file for a session.

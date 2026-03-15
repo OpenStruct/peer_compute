@@ -24,6 +24,7 @@ message Provider {
   string status = 6; // "online", "offline", "busy"
   google.protobuf.Timestamp last_heartbeat = 7;
   google.protobuf.Timestamp registered_at = 8;
+  string public_address = 9; // STUN-discovered public IP:port
 }
 
 message Session {
@@ -37,8 +38,43 @@ message Session {
   string image = 8;
   google.protobuf.Timestamp created_at = 9;
   google.protobuf.Timestamp terminated_at = 10;
-  string wg_public_key = 11;   // provider-side WireGuard public key
-  string wg_endpoint = 12;     // provider's WireGuard listen endpoint
+  string wg_public_key = 11;     // provider-side WireGuard public key
+  string wg_endpoint = 12;       // provider's WireGuard endpoint
+  string connection_mode = 13;   // "direct", "holepunch", "relay"
+  string relay_token = 14;       // token for relay authentication
+}
+
+// ── NAT Traversal ───────────────────────────────────────────────────
+
+message EndpointCandidate {
+  string address = 1;    // ip:port
+  string type = 2;       // "host", "srflx" (server-reflexive), "relay"
+  int64 priority = 3;
+}
+
+message ExchangeCandidatesRequest {
+  string session_id = 1;
+  string peer_id = 2;
+  repeated EndpointCandidate candidates = 3;
+  string wg_public_key = 4;
+}
+
+message ExchangeCandidatesResponse {
+  repeated EndpointCandidate peer_candidates = 1;
+  string peer_wg_public_key = 2;
+  string relay_address = 3;
+  string relay_token = 4;
+}
+
+message ReportConnectionResultRequest {
+  string session_id = 1;
+  string peer_id = 2;
+  string selected_endpoint = 3;
+  bool use_relay = 4;
+}
+
+message ReportConnectionResultResponse {
+  bool acknowledged = 1;
 }
 
 // ── Requests / Responses ────────────────────────────────────────────
@@ -105,7 +141,7 @@ message TerminateSessionResponse {
 
 message ListProviderSessionsRequest {
   string provider_id = 1;
-  string status_filter = 2; // e.g. "pending", "running"
+  string status_filter = 2;
 }
 
 message ListProviderSessionsResponse {
@@ -141,4 +177,8 @@ service RegistryService {
   // Agent-facing RPCs
   rpc ListProviderSessions(ListProviderSessionsRequest) returns (ListProviderSessionsResponse);
   rpc UpdateSessionStatus(UpdateSessionStatusRequest) returns (UpdateSessionStatusResponse);
+
+  // NAT traversal
+  rpc ExchangeCandidates(ExchangeCandidatesRequest) returns (ExchangeCandidatesResponse);
+  rpc ReportConnectionResult(ReportConnectionResultRequest) returns (ReportConnectionResultResponse);
 }

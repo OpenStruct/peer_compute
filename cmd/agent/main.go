@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,6 +24,11 @@ func main() {
 	}
 	defer conn.Close()
 
+	registryHost := registryAddr
+	if h, _, err := net.SplitHostPort(registryAddr); err == nil {
+		registryHost = h
+	}
+
 	daemon, err := agent.NewDaemon(agent.Config{
 		Name:              envOr("PROVIDER_NAME", hostname()),
 		Address:           envOr("PROVIDER_ADDR", "localhost:50052"),
@@ -31,6 +37,8 @@ func main() {
 		CPUCores:          4,
 		MemoryMB:          8192,
 		DiskGB:            100,
+		STUNAddr:          envOr("STUN_ADDR", registryHost+":3478"),
+		RelayAddr:         envOr("RELAY_ADDR", registryHost+":3479"),
 	})
 	if err != nil {
 		log.Fatalf("failed to create daemon: %v", err)

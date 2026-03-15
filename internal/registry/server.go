@@ -2,10 +2,9 @@ package registry
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
-
-	"strings"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -13,9 +12,39 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	computev1 "peer-compute/gen/compute/v1"
+	"peer-compute/internal/relay"
 )
 
 const heartbeatTimeout = 30 * time.Second
+
+// Server implements the RegistryService gRPC server.
+// MVP: in-memory store. Swap to PostgreSQL + Redis for production.
+type Server struct {
+	computev1.UnimplementedRegistryServiceServer
+
+	mu        sync.RWMutex
+	providers map[string]*computev1.Provider
+	sessions  map[string]*computev1.Session
+
+	// NAT traversal state: sessionID -> peerID -> candidateSet
+	candidates map[string]map[string]*candidateSet
+
+	relay *relay.RelayServer
+}
+
+type candidateSet struct {
+	candidates  []*computev1.EndpointCandidate
+	wgPublicKey string
+}
+
+func NewServer(relayServer *relay.RelayServer) *Server {
+	return &Server{
+		providers:  make(map[string]*computev1.Provider),
+		sessions:   make(map[string]*computev1.Session),
+		candidates: make(map[string]map[string]*candidateSet),
+		relay:      relayServer,
+	}
+}
 
 // resolveProvider finds a provider by full ID or unique prefix.
 func (s *Server) resolveProvider(prefix string) (*computev1.Provider, error) {
@@ -55,23 +84,6 @@ func (s *Server) resolveSession(prefix string) (*computev1.Session, error) {
 		return nil, status.Error(codes.NotFound, "session not found")
 	}
 	return match, nil
-}
-
-// Server implements the RegistryService gRPC server.
-// MVP: in-memory store. Swap to PostgreSQL + Redis for production.
-type Server struct {
-	computev1.UnimplementedRegistryServiceServer
-
-	mu        sync.RWMutex
-	providers map[string]*computev1.Provider
-	sessions  map[string]*computev1.Session
-}
-
-func NewServer() *Server {
-	return &Server{
-		providers: make(map[string]*computev1.Provider),
-		sessions:  make(map[string]*computev1.Session),
-	}
 }
 
 func (s *Server) RegisterProvider(_ context.Context, req *computev1.RegisterProviderRequest) (*computev1.RegisterProviderResponse, error) {
@@ -156,6 +168,8 @@ func (s *Server) CreateSession(_ context.Context, req *computev1.CreateSessionRe
 		return nil, status.Error(codes.Unavailable, "provider is not online")
 	}
 
+	relayToken := uuid.NewString()
+
 	session := &computev1.Session{
 		Id:         uuid.NewString(),
 		ProviderId: p.Id,
@@ -164,9 +178,20 @@ func (s *Server) CreateSession(_ context.Context, req *computev1.CreateSessionRe
 		Image:      req.Image,
 		Status:     "pending",
 		CreatedAt:  timestamppb.Now(),
+		RelayToken: relayToken,
 	}
 
 	s.sessions[session.Id] = session
+
+	// Store renter's WG public key if provided
+	if req.WgPublicKey != "" {
+		if s.candidates[session.Id] == nil {
+			s.candidates[session.Id] = make(map[string]*candidateSet)
+		}
+		s.candidates[session.Id][req.RenterId] = &candidateSet{
+			wgPublicKey: req.WgPublicKey,
+		}
+	}
 
 	return &computev1.CreateSessionResponse{Session: session}, nil
 }
@@ -194,6 +219,12 @@ func (s *Server) TerminateSession(_ context.Context, req *computev1.TerminateSes
 
 	session.Status = "terminated"
 	session.TerminatedAt = timestamppb.Now()
+
+	// Clean up relay and candidate state
+	if session.RelayToken != "" && s.relay != nil {
+		s.relay.RemoveSession(session.RelayToken)
+	}
+	delete(s.candidates, session.Id)
 
 	return &computev1.TerminateSessionResponse{Success: true}, nil
 }
@@ -243,4 +274,63 @@ func (s *Server) UpdateSessionStatus(_ context.Context, req *computev1.UpdateSes
 	}
 
 	return &computev1.UpdateSessionStatusResponse{Success: true}, nil
+}
+
+// ── NAT Traversal RPCs ─────────────────────────────────────────────
+
+func (s *Server) ExchangeCandidates(_ context.Context, req *computev1.ExchangeCandidatesRequest) (*computev1.ExchangeCandidatesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, err := s.resolveSession(req.SessionId)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store this peer's candidates
+	if s.candidates[session.Id] == nil {
+		s.candidates[session.Id] = make(map[string]*candidateSet)
+	}
+	s.candidates[session.Id][req.PeerId] = &candidateSet{
+		candidates:  req.Candidates,
+		wgPublicKey: req.WgPublicKey,
+	}
+
+	// Look for the other peer's candidates
+	resp := &computev1.ExchangeCandidatesResponse{}
+	if s.relay != nil {
+		resp.RelayAddress = s.relay.Addr()
+	}
+	resp.RelayToken = session.RelayToken
+
+	for peerID, cs := range s.candidates[session.Id] {
+		if peerID != req.PeerId {
+			resp.PeerCandidates = cs.candidates
+			resp.PeerWgPublicKey = cs.wgPublicKey
+			break
+		}
+	}
+
+	return resp, nil
+}
+
+func (s *Server) ReportConnectionResult(_ context.Context, req *computev1.ReportConnectionResultRequest) (*computev1.ReportConnectionResultResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, err := s.resolveSession(req.SessionId)
+	if err != nil {
+		return nil, err
+	}
+
+	if req.UseRelay {
+		session.ConnectionMode = "relay"
+		if s.relay != nil {
+			s.relay.RegisterSession(session.RelayToken, session.Id)
+		}
+	} else {
+		session.ConnectionMode = "holepunch"
+	}
+
+	return &computev1.ReportConnectionResultResponse{Acknowledged: true}, nil
 }

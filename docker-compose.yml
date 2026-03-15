@@ -22,8 +22,12 @@ services:
       target: registry
     ports:
       - "50051:50051"
+      - "3478:3478/udp"
+      - "3479:3479/udp"
     environment:
       PORT: "50051"
+      STUN_PORT: "3478"
+      RELAY_PORT: "3479"
       DATABASE_URL: postgres://peercompute:peercompute@postgres:5432/peercompute?sslmode=disable
       REDIS_URL: redis://redis:6379
     depends_on:
