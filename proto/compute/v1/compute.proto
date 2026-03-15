@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package compute.v1;
+
+option go_package = "peer-compute/gen/compute/v1;computev1";
+
+import "google/protobuf/timestamp.proto";
+
+// Resource capacity advertised by a provider.
+message Resources {
+  uint32 cpu_cores = 1;
+  uint64 memory_mb = 2;
+  uint64 disk_gb = 3;
+  uint32 gpu_count = 4;
+  string gpu_model = 5;
+}
+
+message Provider {
+  string id = 1;
+  string name = 2;
+  string address = 3;
+  Resources capacity = 4;
+  Resources available = 5;
+  string status = 6; // "online", "offline", "busy"
+  google.protobuf.Timestamp last_heartbeat = 7;
+  google.protobuf.Timestamp registered_at = 8;
+}
+
+message Session {
+  string id = 1;
+  string provider_id = 2;
+  string renter_id = 3;
+  Resources allocated = 4;
+  string status = 5; // "pending", "running", "terminated"
+  string container_id = 6;
+  string ssh_endpoint = 7;
+  string image = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp terminated_at = 10;
+}
+
+// ── Requests / Responses ────────────────────────────────────────────
+
+message RegisterProviderRequest {
+  string name = 1;
+  string address = 2;
+  Resources capacity = 3;
+}
+
+message RegisterProviderResponse {
+  Provider provider = 1;
+  string token = 2;
+}
+
+message HeartbeatRequest {
+  string provider_id = 1;
+  Resources available = 2;
+  repeated string active_sessions = 3;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  repeated string terminate_sessions = 2;
+}
+
+message ListProvidersRequest {
+  uint32 min_cpu = 1;
+  uint64 min_memory_mb = 2;
+  uint32 min_gpu = 3;
+}
+
+message ListProvidersResponse {
+  repeated Provider providers = 1;
+}
+
+message CreateSessionRequest {
+  string provider_id = 1;
+  string renter_id = 2;
+  Resources requested = 3;
+  string image = 4;
+}
+
+message CreateSessionResponse {
+  Session session = 1;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message GetSessionResponse {
+  Session session = 1;
+}
+
+message TerminateSessionRequest {
+  string session_id = 1;
+}
+
+message TerminateSessionResponse {
+  bool success = 1;
+}
+
+// ── Services ────────────────────────────────────────────────────────
+
+service RegistryService {
+  // Provider lifecycle
+  rpc RegisterProvider(RegisterProviderRequest) returns (RegisterProviderResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+
+  // Session management
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc TerminateSession(TerminateSessionRequest) returns (TerminateSessionResponse);
+}
