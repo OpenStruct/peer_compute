@@ -13,6 +13,7 @@ import (
 
 	computev1 "peer-compute/gen/compute/v1"
 	"peer-compute/internal/relay"
+	"peer-compute/plugin"
 )
 
 const heartbeatTimeout = 30 * time.Second
@@ -29,7 +30,8 @@ type Server struct {
 	// NAT traversal state: sessionID -> peerID -> candidateSet
 	candidates map[string]map[string]*candidateSet
 
-	relay *relay.RelayServer
+	relay   *relay.RelayServer
+	plugins *plugin.Bundle
 }
 
 type candidateSet struct {
@@ -37,13 +39,26 @@ type candidateSet struct {
 	wgPublicKey string
 }
 
-func NewServer(relayServer *relay.RelayServer) *Server {
-	return &Server{
+// Option configures the server.
+type Option func(*Server)
+
+// WithPlugins sets custom plugin implementations (marketplace).
+func WithPlugins(b *plugin.Bundle) Option {
+	return func(s *Server) { s.plugins = b }
+}
+
+func NewServer(relayServer *relay.RelayServer, opts ...Option) *Server {
+	s := &Server{
 		providers:  make(map[string]*computev1.Provider),
 		sessions:   make(map[string]*computev1.Session),
 		candidates: make(map[string]map[string]*candidateSet),
 		relay:      relayServer,
+		plugins:    plugin.Defaults(),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // resolveProvider finds a provider by full ID or unique prefix.
@@ -156,7 +171,7 @@ func (s *Server) ListProviders(_ context.Context, req *computev1.ListProvidersRe
 	return &computev1.ListProvidersResponse{Providers: out}, nil
 }
 
-func (s *Server) CreateSession(_ context.Context, req *computev1.CreateSessionRequest) (*computev1.CreateSessionResponse, error) {
+func (s *Server) CreateSession(ctx context.Context, req *computev1.CreateSessionRequest) (*computev1.CreateSessionResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -166,6 +181,11 @@ func (s *Server) CreateSession(_ context.Context, req *computev1.CreateSessionRe
 	}
 	if p.Status != "online" {
 		return nil, status.Error(codes.Unavailable, "provider is not online")
+	}
+
+	// Plugin: check provider reputation
+	if ok, err := s.plugins.Reputation.MeetsMinimum(ctx, p.Id, 50); err != nil || !ok {
+		return nil, status.Error(codes.Unavailable, "provider does not meet minimum reputation")
 	}
 
 	relayToken := uuid.NewString()
@@ -208,7 +228,7 @@ func (s *Server) GetSession(_ context.Context, req *computev1.GetSessionRequest)
 	return &computev1.GetSessionResponse{Session: session}, nil
 }
 
-func (s *Server) TerminateSession(_ context.Context, req *computev1.TerminateSessionRequest) (*computev1.TerminateSessionResponse, error) {
+func (s *Server) TerminateSession(ctx context.Context, req *computev1.TerminateSessionRequest) (*computev1.TerminateSessionResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -219,6 +239,8 @@ func (s *Server) TerminateSession(_ context.Context, req *computev1.TerminateSes
 
 	session.Status = "terminated"
 	session.TerminatedAt = timestamppb.Now()
+
+	s.plugins.Reputation.RecordOutcome(ctx, session.Id, true)
 
 	// Clean up relay and candidate state
 	if session.RelayToken != "" && s.relay != nil {
@@ -247,7 +269,7 @@ func (s *Server) ListProviderSessions(_ context.Context, req *computev1.ListProv
 	return &computev1.ListProviderSessionsResponse{Sessions: out}, nil
 }
 
-func (s *Server) UpdateSessionStatus(_ context.Context, req *computev1.UpdateSessionStatusRequest) (*computev1.UpdateSessionStatusResponse, error) {
+func (s *Server) UpdateSessionStatus(ctx context.Context, req *computev1.UpdateSessionStatusRequest) (*computev1.UpdateSessionStatusResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -256,7 +278,12 @@ func (s *Server) UpdateSessionStatus(_ context.Context, req *computev1.UpdateSes
 		return nil, err
 	}
 
+	prevStatus := session.Status
 	session.Status = req.Status
+
+	if req.Status == "terminated" && prevStatus != "terminated" {
+		s.plugins.Reputation.RecordOutcome(ctx, session.Id, true)
+	}
 	if req.ContainerId != "" {
 		session.ContainerId = req.ContainerId
 	}

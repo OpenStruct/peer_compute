@@ -151,7 +151,6 @@ make lint
 
 - [ ] GPU support (NVIDIA Container Toolkit / MIG)
 - [ ] PostgreSQL + Redis persistent store
-- [ ] Billing / metering service
 - [ ] Reputation system for providers and renters
 - [ ] Web UI (Next.js)
 - [ ] `wg-quick` auto-activation
