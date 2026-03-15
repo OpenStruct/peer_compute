@@ -10,9 +10,9 @@ import (
 
 	"google.golang.org/grpc"
 
-	computev1 "peer-compute/gen/compute/v1"
-	"peer-compute/internal/nat"
-	"peer-compute/internal/relay"
+	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
+	"github.com/OpenStruct/peer_compute/internal/nat"
+	"github.com/OpenStruct/peer_compute/internal/relay"
 )
 
 type Config struct {

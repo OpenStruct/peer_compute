@@ -11,7 +11,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 
-	computev1 "peer-compute/gen/compute/v1"
+	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
 )
 
 // ContainerRunner manages Docker containers for compute sessions.

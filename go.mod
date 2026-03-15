@@ -1,4 +1,4 @@
-module peer-compute
+module github.com/OpenStruct/peer_compute
 
 go 1.25.5
 

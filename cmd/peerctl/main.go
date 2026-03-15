@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"peer-compute/internal/cli"
+	"github.com/OpenStruct/peer_compute/internal/cli"
 )
 
 func main() {

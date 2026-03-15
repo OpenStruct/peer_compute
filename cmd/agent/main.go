@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"peer-compute/internal/agent"
+	"github.com/OpenStruct/peer_compute/internal/agent"
 )
 
 func main() {

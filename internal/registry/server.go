@@ -11,9 +11,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	computev1 "peer-compute/gen/compute/v1"
-	"peer-compute/internal/relay"
-	"peer-compute/plugin"
+	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
+	"github.com/OpenStruct/peer_compute/internal/relay"
+	"github.com/OpenStruct/peer_compute/plugin"
 )
 
 const heartbeatTimeout = 30 * time.Second
