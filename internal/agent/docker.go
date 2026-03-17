@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -17,14 +17,15 @@ import (
 // ContainerRunner manages Docker containers for compute sessions.
 type ContainerRunner struct {
 	cli *client.Client
+	log *slog.Logger
 }
 
-func NewContainerRunner() (*ContainerRunner, error) {
+func NewContainerRunner(log *slog.Logger) (*ContainerRunner, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	return &ContainerRunner{cli: cli}, nil
+	return &ContainerRunner{cli: cli, log: log}, nil
 }
 
 func (cr *ContainerRunner) Close() error {
@@ -35,7 +36,7 @@ func (cr *ContainerRunner) Close() error {
 // Returns the container ID and the host-mapped SSH port.
 func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string, res *computev1.Resources, imageName string) (containerID string, sshPort string, err error) {
 	// Pull image
-	log.Printf("pulling image %s", imageName)
+	cr.log.Debug("pulling image", "image", imageName)
 	reader, err := cr.cli.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
 		return "", "", fmt.Errorf("image pull: %w", err)
@@ -94,15 +95,15 @@ func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string,
 		sshPort = bindings[0].HostPort
 	}
 
-	log.Printf("started container %s (ssh port: %s)", resp.ID[:12], sshPort)
+	cr.log.Info("started container", "container_id", resp.ID[:12], "ssh_port", sshPort)
 	return resp.ID, sshPort, nil
 }
 
 // StopContainer stops and removes a container.
 func (cr *ContainerRunner) StopContainer(ctx context.Context, containerID string) error {
-	log.Printf("stopping container %s", containerID[:12])
+	cr.log.Info("stopping container", "container_id", containerID[:12])
 	if err := cr.cli.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
-		log.Printf("container stop warning: %v", err)
+		cr.log.Warn("container stop warning", "container_id", containerID[:12], "error", err)
 	}
 	return cr.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 }

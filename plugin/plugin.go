@@ -95,6 +95,8 @@ type SessionRecord struct {
 	RelayToken     string
 	WGPublicKey    string
 	WGEndpoint     string
+	WGProviderIP   string // per-session tunnel IP for provider (e.g. "10.99.1.1")
+	WGRenterIP     string // per-session tunnel IP for renter (e.g. "10.99.1.2")
 	CPUCores       uint32
 	MemoryMB       uint64
 	CreatedAt      int64

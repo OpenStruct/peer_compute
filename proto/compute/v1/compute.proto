@@ -42,6 +42,8 @@ message Session {
   string wg_endpoint = 12;       // provider's WireGuard endpoint
   string connection_mode = 13;   // "direct", "holepunch", "relay"
   string relay_token = 14;       // token for relay authentication
+  string wg_provider_ip = 15;   // per-session tunnel IP for provider (e.g. "10.99.1.1")
+  string wg_renter_ip = 16;     // per-session tunnel IP for renter (e.g. "10.99.1.2")
 }
 
 // ── NAT Traversal ───────────────────────────────────────────────────

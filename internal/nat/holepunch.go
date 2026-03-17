@@ -5,21 +5,21 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"time"
 )
 
 var (
-	probeMagic        = []byte("PCPR") // Peer Compute PRobe
-	probeAckMagic     = []byte("PCPA") // Peer Compute Probe Ack
+	probeMagic         = []byte("PCPR") // Peer Compute PRobe
+	probeAckMagic      = []byte("PCPA") // Peer Compute Probe Ack
 	ErrHolePunchFailed = errors.New("hole punch failed: no candidates reachable")
 )
 
 // Probe attempts UDP hole-punching against remote candidates.
 // It sends probe packets to all remote candidates and listens for responses.
 // Returns the first working remote address, or ErrHolePunchFailed on timeout.
-func Probe(ctx context.Context, localPort int, remoteCandidates []Candidate, timeout time.Duration) (string, error) {
+func Probe(ctx context.Context, localPort int, remoteCandidates []Candidate, timeout time.Duration, log *slog.Logger) (string, error) {
 	if len(remoteCandidates) == 0 {
 		return "", ErrHolePunchFailed
 	}
@@ -108,7 +108,7 @@ func Probe(ctx context.Context, localPort int, remoteCandidates []Candidate, tim
 
 	select {
 	case addr := <-result:
-		log.Printf("hole punch succeeded: %s", addr)
+		log.Debug("hole punch succeeded", "addr", addr)
 		return addr, nil
 	case <-ctx.Done():
 		return "", ErrHolePunchFailed

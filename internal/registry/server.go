@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -26,6 +27,11 @@ type Server struct {
 	mu         sync.RWMutex
 	candidates map[string]map[string]*candidateSet
 
+	// Tunnel IP allocation for multi-session WireGuard
+	tunnelMu       sync.Mutex
+	nextTunnelIdx  uint32            // starts at 1, wraps at 255
+	usedTunnelIdxs map[string]uint32 // sessionID -> tunnel index
+
 	relay   *relay.RelayServer
 	plugins *plugin.Bundle
 }
@@ -45,14 +51,38 @@ func WithPlugins(b *plugin.Bundle) Option {
 
 func NewServer(relayServer *relay.RelayServer, opts ...Option) *Server {
 	s := &Server{
-		candidates: make(map[string]map[string]*candidateSet),
-		relay:      relayServer,
-		plugins:    plugin.Defaults(),
+		candidates:     make(map[string]map[string]*candidateSet),
+		nextTunnelIdx:  1,
+		usedTunnelIdxs: make(map[string]uint32),
+		relay:          relayServer,
+		plugins:        plugin.Defaults(),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 	return s
+}
+
+// allocateTunnelIPs assigns unique per-session tunnel IPs.
+func (s *Server) allocateTunnelIPs(sessionID string) (providerIP, renterIP string) {
+	s.tunnelMu.Lock()
+	defer s.tunnelMu.Unlock()
+
+	idx := s.nextTunnelIdx
+	s.nextTunnelIdx++
+	if s.nextTunnelIdx > 254 {
+		s.nextTunnelIdx = 1
+	}
+	s.usedTunnelIdxs[sessionID] = idx
+
+	return fmt.Sprintf("10.99.%d.1", idx), fmt.Sprintf("10.99.%d.2", idx)
+}
+
+// reclaimTunnelIndex frees a tunnel index when a session terminates.
+func (s *Server) reclaimTunnelIndex(sessionID string) {
+	s.tunnelMu.Lock()
+	defer s.tunnelMu.Unlock()
+	delete(s.usedTunnelIdxs, sessionID)
 }
 
 // ── Conversions ────────────────────────────────────────────────────
@@ -99,6 +129,8 @@ func sessionToProto(r *plugin.SessionRecord) *computev1.Session {
 		WgEndpoint:     r.WGEndpoint,
 		ConnectionMode: r.ConnectionMode,
 		RelayToken:     r.RelayToken,
+		WgProviderIp:   r.WGProviderIP,
+		WgRenterIp:     r.WGRenterIP,
 	}
 	if r.TerminatedAt > 0 {
 		s.TerminatedAt = timestamppb.New(time.Unix(r.TerminatedAt, 0))
@@ -215,14 +247,19 @@ func (s *Server) CreateSession(ctx context.Context, req *computev1.CreateSession
 	relayToken := uuid.NewString()
 	sessionID := uuid.NewString()
 
+	// Allocate per-session tunnel IPs
+	providerIP, renterIP := s.allocateTunnelIPs(sessionID)
+
 	rec := &plugin.SessionRecord{
-		ID:         sessionID,
-		ProviderID: pRec.ID,
-		RenterID:   req.RenterId,
-		Image:      req.Image,
-		Status:     "pending",
-		RelayToken: relayToken,
-		CreatedAt:  time.Now().Unix(),
+		ID:           sessionID,
+		ProviderID:   pRec.ID,
+		RenterID:     req.RenterId,
+		Image:        req.Image,
+		Status:       "pending",
+		RelayToken:   relayToken,
+		WGProviderIP: providerIP,
+		WGRenterIP:   renterIP,
+		CreatedAt:    time.Now().Unix(),
 	}
 	if req.Requested != nil {
 		rec.CPUCores = req.Requested.CpuCores
@@ -272,13 +309,14 @@ func (s *Server) TerminateSession(ctx context.Context, req *computev1.TerminateS
 
 	s.plugins.Reputation.RecordOutcome(ctx, rec.ID, true)
 
-	// Clean up relay and candidate state
+	// Clean up relay, candidate, and tunnel index state
 	if rec.RelayToken != "" && s.relay != nil {
 		s.relay.RemoveSession(rec.RelayToken)
 	}
 	s.mu.Lock()
 	delete(s.candidates, rec.ID)
 	s.mu.Unlock()
+	s.reclaimTunnelIndex(rec.ID)
 
 	return &computev1.TerminateSessionResponse{Success: true}, nil
 }
@@ -312,6 +350,7 @@ func (s *Server) UpdateSessionStatus(ctx context.Context, req *computev1.UpdateS
 	if req.Status == "terminated" && prevStatus != "terminated" {
 		s.plugins.Reputation.RecordOutcome(ctx, rec.ID, true)
 		rec.TerminatedAt = time.Now().Unix()
+		s.reclaimTunnelIndex(rec.ID)
 	}
 	if req.ContainerId != "" {
 		rec.ContainerID = req.ContainerId

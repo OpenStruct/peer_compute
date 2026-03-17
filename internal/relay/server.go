@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"hash/fnv"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -20,6 +20,7 @@ type RelayServer struct {
 	sessions map[uint32]*relaySession // token hash -> session
 	conn     *net.UDPConn
 	addr     string
+	log      *slog.Logger
 }
 
 type relaySession struct {
@@ -30,10 +31,11 @@ type relaySession struct {
 	created   time.Time
 }
 
-func NewRelayServer(listenAddr string) *RelayServer {
+func NewRelayServer(listenAddr string, log *slog.Logger) *RelayServer {
 	return &RelayServer{
 		sessions: make(map[uint32]*relaySession),
 		addr:     listenAddr,
+		log:      log,
 	}
 }
 
@@ -52,7 +54,7 @@ func (rs *RelayServer) RegisterSession(token, sessionID string) {
 		created:   time.Now(),
 	}
 	rs.mu.Unlock()
-	log.Printf("relay: registered session %s (token hash %08x)", sessionID[:8], h)
+	rs.log.Info("relay session registered", "session_id", sessionID[:8], "token_hash", h)
 }
 
 // RemoveSession deactivates relaying for a token.
@@ -77,7 +79,7 @@ func (rs *RelayServer) Run(ctx context.Context) error {
 	rs.conn = conn
 	defer conn.Close()
 
-	log.Printf("relay server listening on %s", rs.addr)
+	rs.log.Info("relay server listening", "addr", rs.addr)
 
 	go func() {
 		<-ctx.Done()
@@ -92,7 +94,7 @@ func (rs *RelayServer) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			default:
-				log.Printf("relay read error: %v", err)
+				rs.log.Warn("relay read error", "error", err)
 				continue
 			}
 		}

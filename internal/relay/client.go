@@ -3,7 +3,7 @@ package relay
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"time"
 )
@@ -16,12 +16,13 @@ type RelayClient struct {
 	tokenHash []byte // 4-byte token hash
 	proxyPort int    // local port WireGuard connects to
 	wgPort    int    // local WireGuard listen port to forward incoming packets to
+	log       *slog.Logger
 }
 
 // NewRelayClient creates a relay client.
 // proxyPort: the local port that WireGuard's Peer Endpoint points to.
 // wgPort: the local WireGuard listen port for forwarding inbound traffic.
-func NewRelayClient(relayAddr string, token string, proxyPort, wgPort int) (*RelayClient, error) {
+func NewRelayClient(relayAddr string, token string, proxyPort, wgPort int, log *slog.Logger) (*RelayClient, error) {
 	raddr, err := net.ResolveUDPAddr("udp", relayAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolve relay addr: %w", err)
@@ -32,6 +33,7 @@ func NewRelayClient(relayAddr string, token string, proxyPort, wgPort int) (*Rel
 		tokenHash: TokenHashBytes(token),
 		proxyPort: proxyPort,
 		wgPort:    wgPort,
+		log:       log,
 	}, nil
 }
 
@@ -57,7 +59,7 @@ func (rc *RelayClient) Run(ctx context.Context) error {
 	}
 	defer relayConn.Close()
 
-	log.Printf("relay client running (proxy=:%d, relay=%s)", rc.proxyPort, rc.relayAddr)
+	rc.log.Info("relay client running", "proxy_port", rc.proxyPort, "relay_addr", rc.relayAddr)
 
 	go func() {
 		<-ctx.Done()

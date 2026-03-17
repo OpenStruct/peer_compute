@@ -1,4 +1,6 @@
-.PHONY: proto build test clean lint dev
+.PHONY: proto build test clean lint dev migrate-up migrate-down
+
+DATABASE_URL ?= postgres://peercompute:peercompute@localhost:5432/peercompute?sslmode=disable
 
 PROTO_DIR := proto
 GEN_DIR   := gen
@@ -27,5 +29,11 @@ lint:
 
 dev:
 	docker compose up -d postgres redis
+
+migrate-up:
+	psql "$(DATABASE_URL)" -f migrations/001_init.up.sql
+
+migrate-down:
+	psql "$(DATABASE_URL)" -f migrations/001_init.down.sql
 
 .DEFAULT_GOAL := build

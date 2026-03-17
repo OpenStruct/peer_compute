@@ -6,14 +6,14 @@ package serve
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
 	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
-	"github.com/OpenStruct/peer_compute/internal/nat"
+	"github.com/OpenStruct/peer_compute/internal/logging"
+	internalnat "github.com/OpenStruct/peer_compute/internal/nat"
 	"github.com/OpenStruct/peer_compute/internal/registry"
 	"github.com/OpenStruct/peer_compute/internal/relay"
 	"github.com/OpenStruct/peer_compute/plugin"
@@ -40,6 +40,8 @@ type RegistryConfig struct {
 
 // Registry starts the full registry server (gRPC + STUN + Relay) and blocks until ctx is cancelled.
 func Registry(ctx context.Context, cfg RegistryConfig) error {
+	log := logging.New("registry")
+
 	if cfg.GRPCPort == "" {
 		cfg.GRPCPort = "50051"
 	}
@@ -51,17 +53,17 @@ func Registry(ctx context.Context, cfg RegistryConfig) error {
 	}
 
 	// Start relay server
-	relaySrv := relay.NewRelayServer(":" + cfg.RelayPort)
+	relaySrv := relay.NewRelayServer(":"+cfg.RelayPort, log.With("sub", "relay"))
 	go func() {
 		if err := relaySrv.Run(ctx); err != nil {
-			log.Printf("relay server error: %v", err)
+			log.Error("relay server error", "error", err)
 		}
 	}()
 
 	// Start STUN server
 	go func() {
-		if err := nat.RunSTUNServer(ctx, ":"+cfg.STUNPort); err != nil {
-			log.Printf("stun server error: %v", err)
+		if err := internalnat.RunSTUNServer(ctx, ":"+cfg.STUNPort, log.With("sub", "stun")); err != nil {
+			log.Error("stun server error", "error", err)
 		}
 	}()
 
@@ -84,10 +86,10 @@ func Registry(ctx context.Context, cfg RegistryConfig) error {
 
 	go func() {
 		<-ctx.Done()
-		log.Println("shutting down registry...")
+		log.Info("shutting down registry")
 		grpcServer.GracefulStop()
 	}()
 
-	log.Printf("registry listening on :%s (stun=:%s, relay=:%s)", cfg.GRPCPort, cfg.STUNPort, cfg.RelayPort)
+	log.Info("registry listening", "grpc_port", cfg.GRPCPort, "stun_port", cfg.STUNPort, "relay_port", cfg.RelayPort)
 	return grpcServer.Serve(lis)
 }

@@ -3,7 +3,7 @@ package nat
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 )
 
@@ -17,7 +17,7 @@ type Candidate struct {
 // GatherCandidates discovers local and public endpoints for a given port.
 // It enumerates local interfaces (host candidates) and queries the STUN
 // server for a server-reflexive candidate.
-func GatherCandidates(ctx context.Context, stunAddr string, localPort int) ([]Candidate, error) {
+func GatherCandidates(ctx context.Context, stunAddr string, localPort int, log *slog.Logger) ([]Candidate, error) {
 	var candidates []Candidate
 
 	// 1. Host candidates from local interfaces
@@ -58,7 +58,7 @@ func GatherCandidates(ctx context.Context, stunAddr string, localPort int) ([]Ca
 	if stunAddr != "" {
 		pubAddr, err := DiscoverEndpoint(ctx, stunAddr, 0)
 		if err != nil {
-			log.Printf("stun discovery failed (non-fatal): %v", err)
+			log.Debug("stun discovery failed", "error", err)
 		} else {
 			candidates = append(candidates, Candidate{
 				Address:  pubAddr,

@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 
 	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
+	"github.com/OpenStruct/peer_compute/internal/logging"
 	"github.com/OpenStruct/peer_compute/internal/nat"
 	"github.com/OpenStruct/peer_compute/internal/relay"
+	"github.com/OpenStruct/peer_compute/internal/retry"
 )
 
 type Config struct {
@@ -35,6 +39,7 @@ type Daemon struct {
 	runner   *ContainerRunner
 	provider *computev1.Provider
 	token    string
+	log      *slog.Logger
 
 	mu       sync.Mutex
 	sessions map[string]*runningSession // sessionID -> running state
@@ -56,7 +61,9 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		cfg.WGListenPort = 51820
 	}
 
-	runner, err := NewContainerRunner()
+	log := logging.New("agent")
+
+	runner, err := NewContainerRunner(log.With("sub", "docker"))
 	if err != nil {
 		return nil, fmt.Errorf("docker: %w", err)
 	}
@@ -66,6 +73,7 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		client:   computev1.NewRegistryServiceClient(cfg.RegistryConn),
 		runner:   runner,
 		sessions: make(map[string]*runningSession),
+		log:      log,
 	}, nil
 }
 
@@ -73,7 +81,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.register(ctx); err != nil {
 		return err
 	}
-	log.Printf("registered as provider %s (id=%s)", d.provider.Name, d.provider.Id)
+	d.log.Info("registered as provider", "name", d.provider.Name, "id", d.provider.Id)
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- d.heartbeatLoop(ctx) }()
@@ -123,13 +131,21 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) error {
 			}
 			d.mu.Unlock()
 
-			resp, err := d.client.Heartbeat(ctx, &computev1.HeartbeatRequest{
-				ProviderId:     d.provider.Id,
-				Available:      d.provider.Available,
-				ActiveSessions: activeIDs,
+			var resp *computev1.HeartbeatResponse
+			err := retry.Do(ctx, retry.Config{
+				MaxAttempts: 3, BaseDelay: 1 * time.Second,
+				MaxDelay: 5 * time.Second, Jitter: 0.3,
+			}, func(ctx context.Context) error {
+				var rpcErr error
+				resp, rpcErr = d.client.Heartbeat(ctx, &computev1.HeartbeatRequest{
+					ProviderId:     d.provider.Id,
+					Available:      d.provider.Available,
+					ActiveSessions: activeIDs,
+				})
+				return rpcErr
 			})
 			if err != nil {
-				log.Printf("heartbeat failed: %v", err)
+				d.log.Warn("heartbeat failed after retries", "error", err)
 				continue
 			}
 
@@ -137,7 +153,7 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) error {
 				go d.stopSession(context.Background(), sid)
 			}
 
-			log.Printf("heartbeat ok (%d active sessions)", len(activeIDs))
+			d.log.Debug("heartbeat ok", "active_sessions", len(activeIDs))
 		}
 	}
 }
@@ -151,12 +167,20 @@ func (d *Daemon) sessionLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			resp, err := d.client.ListProviderSessions(ctx, &computev1.ListProviderSessionsRequest{
-				ProviderId:   d.provider.Id,
-				StatusFilter: "pending",
+			var resp *computev1.ListProviderSessionsResponse
+			err := retry.Do(ctx, retry.Config{
+				MaxAttempts: 3, BaseDelay: 500 * time.Millisecond,
+				MaxDelay: 3 * time.Second, Jitter: 0.3,
+			}, func(ctx context.Context) error {
+				var rpcErr error
+				resp, rpcErr = d.client.ListProviderSessions(ctx, &computev1.ListProviderSessionsRequest{
+					ProviderId:   d.provider.Id,
+					StatusFilter: "pending",
+				})
+				return rpcErr
 			})
 			if err != nil {
-				log.Printf("poll sessions failed: %v", err)
+				d.log.Warn("session poll failed after retries", "error", err)
 				continue
 			}
 
@@ -174,12 +198,13 @@ func (d *Daemon) sessionLoop(ctx context.Context) error {
 }
 
 func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
-	log.Printf("starting session %s (image=%s)", sess.Id[:8], sess.Image)
+	sid := sess.Id[:8]
+	d.log.Info("starting session", "session_id", sid, "image", sess.Image)
 
 	// 1. Start Docker container
 	containerID, sshPort, err := d.runner.StartContainer(ctx, sess.Id, sess.Allocated, sess.Image)
 	if err != nil {
-		log.Printf("session %s: container failed: %v", sess.Id[:8], err)
+		d.log.Error("container start failed", "session_id", sid, "error", err)
 		d.updateStatus(ctx, sess.Id, "terminated", "", "")
 		return
 	}
@@ -187,18 +212,19 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	// 2. Generate WireGuard keypair
 	kp, err := GenerateKeyPair()
 	if err != nil {
-		log.Printf("session %s: keygen failed: %v", sess.Id[:8], err)
+		d.log.Error("keygen failed", "session_id", sid, "error", err)
 		d.runner.StopContainer(ctx, containerID)
 		d.updateStatus(ctx, sess.Id, "terminated", "", "")
 		return
 	}
 
-	wgPort := d.cfg.WGListenPort + d.activeSessionCount()
+	// Derive WG port from per-session tunnel index for deterministic, collision-free allocation
+	wgPort := d.cfg.WGListenPort + parseTunnelIndex(sess.GetWgProviderIp())
 
 	// 3. Gather endpoint candidates (local + STUN)
-	candidates, err := nat.GatherCandidates(ctx, d.cfg.STUNAddr, wgPort)
+	candidates, err := nat.GatherCandidates(ctx, d.cfg.STUNAddr, wgPort, d.log)
 	if err != nil {
-		log.Printf("session %s: candidate gathering failed: %v", sess.Id[:8], err)
+		d.log.Warn("candidate gathering failed", "session_id", sid, "error", err)
 	}
 
 	// Convert to proto candidates
@@ -219,7 +245,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 		WgPublicKey: kp.PublicKey,
 	})
 	if err != nil {
-		log.Printf("session %s: candidate exchange failed: %v", sess.Id[:8], err)
+		d.log.Warn("candidate exchange failed", "session_id", sid, "error", err)
 	}
 
 	// 5. Attempt hole-punching if we have peer candidates
@@ -239,22 +265,22 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 			}
 		}
 
-		addr, err := nat.Probe(ctx, wgPort, remoteCandidates, 10*time.Second)
+		addr, err := nat.Probe(ctx, wgPort, remoteCandidates, 10*time.Second, d.log)
 		if err == nil {
 			peerEndpoint = addr
 			connMode = "holepunch"
-			log.Printf("session %s: hole punch succeeded -> %s", sess.Id[:8], addr)
+			d.log.Info("hole punch succeeded", "session_id", sid, "endpoint", addr)
 		} else if errors.Is(err, nat.ErrHolePunchFailed) {
-			log.Printf("session %s: hole punch failed, falling back to relay", sess.Id[:8])
+			d.log.Info("hole punch failed, falling back to relay", "session_id", sid)
 		}
 	}
 
 	// 6. Relay fallback
 	if connMode == "" && exchResp.GetRelayAddress() != "" {
 		proxyPort := wgPort + 10000 // offset to avoid collision
-		rc, err := relay.NewRelayClient(exchResp.RelayAddress, exchResp.RelayToken, proxyPort, wgPort)
+		rc, err := relay.NewRelayClient(exchResp.RelayAddress, exchResp.RelayToken, proxyPort, wgPort, d.log)
 		if err != nil {
-			log.Printf("session %s: relay client failed: %v", sess.Id[:8], err)
+			d.log.Error("relay client failed", "session_id", sid, "error", err)
 		} else {
 			relayCtx, cancel := context.WithCancel(ctx)
 			relayCancel = cancel
@@ -264,13 +290,16 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 			connMode = "relay"
 
 			// Tell registry to activate relay
-			d.client.ReportConnectionResult(ctx, &computev1.ReportConnectionResultRequest{
-				SessionId: sess.Id,
-				PeerId:    d.provider.Id,
-				UseRelay:  true,
+			retry.Do(ctx, retry.DefaultConfig(), func(ctx context.Context) error {
+				_, err := d.client.ReportConnectionResult(ctx, &computev1.ReportConnectionResultRequest{
+					SessionId: sess.Id,
+					PeerId:    d.provider.Id,
+					UseRelay:  true,
+				})
+				return err
 			})
 
-			log.Printf("session %s: relay active via %s", sess.Id[:8], exchResp.RelayAddress)
+			d.log.Info("relay active", "session_id", sid, "relay_addr", exchResp.RelayAddress)
 		}
 	}
 
@@ -279,17 +308,33 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 		peerEndpoint = ""
 	}
 
-	// 7. Write WireGuard config
+	// 7. Write WireGuard config using per-session tunnel IPs
+	providerIP := sess.GetWgProviderIp()
+	renterIP := sess.GetWgRenterIp()
+	if providerIP == "" {
+		providerIP = "10.99.0.1" // fallback for backward compat
+	}
+	if renterIP == "" {
+		renterIP = "10.99.0.2"
+	}
+
 	confPath, err := WriteConfig(sess.Id, WGConfig{
 		PrivateKey:    kp.PrivateKey,
-		TunnelIP:      "10.99.0.1",
+		TunnelIP:      providerIP,
 		ListenPort:    wgPort,
 		PeerPublicKey: peerWGKey,
-		PeerIP:        "10.99.0.2",
+		PeerIP:        renterIP,
 		PeerEndpoint:  peerEndpoint,
 	})
 	if err != nil {
-		log.Printf("session %s: wg config failed: %v", sess.Id[:8], err)
+		d.log.Error("wireguard config failed", "session_id", sid, "error", err)
+	}
+
+	// 7b. Auto-activate WireGuard tunnel (daemon typically runs with root privileges)
+	if confPath != "" {
+		if _, err := WGUp(ctx, confPath, d.log); err != nil {
+			d.log.Warn("wireguard auto-activation failed", "session_id", sid, "error", err)
+		}
 	}
 
 	// 8. Track running session
@@ -310,15 +355,18 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 
 	// Report connection result if holepunch
 	if connMode == "holepunch" {
-		d.client.ReportConnectionResult(ctx, &computev1.ReportConnectionResultRequest{
-			SessionId:        sess.Id,
-			PeerId:           d.provider.Id,
-			SelectedEndpoint: peerEndpoint,
+		retry.Do(ctx, retry.DefaultConfig(), func(ctx context.Context) error {
+			_, err := d.client.ReportConnectionResult(ctx, &computev1.ReportConnectionResultRequest{
+				SessionId:        sess.Id,
+				PeerId:           d.provider.Id,
+				SelectedEndpoint: peerEndpoint,
+			})
+			return err
 		})
 	}
 
-	log.Printf("session %s running (mode=%s, container=%s, ssh=%s, wg=%s)",
-		sess.Id[:8], connMode, containerID[:12], sshEndpoint, wgEndpoint)
+	d.log.Info("session running", "session_id", sid, "mode", connMode,
+		"container", containerID[:12], "ssh", sshEndpoint, "wg", wgEndpoint)
 }
 
 func (d *Daemon) stopSession(ctx context.Context, sessionID string) {
@@ -331,14 +379,21 @@ func (d *Daemon) stopSession(ctx context.Context, sessionID string) {
 	delete(d.sessions, sessionID)
 	d.mu.Unlock()
 
-	log.Printf("stopping session %s", sessionID[:8])
+	d.log.Info("stopping session", "session_id", sessionID[:8])
 
 	if rs.relayCancel != nil {
 		rs.relayCancel()
 	}
 
 	if err := d.runner.StopContainer(ctx, rs.containerID); err != nil {
-		log.Printf("session %s: stop container failed: %v", sessionID[:8], err)
+		d.log.Warn("stop container failed", "session_id", sessionID[:8], "error", err)
+	}
+
+	// Deactivate WireGuard tunnel before removing config
+	if rs.wgConfPath != "" {
+		if err := WGDown(ctx, rs.wgConfPath, d.log); err != nil {
+			d.log.Warn("wireguard deactivation failed", "session_id", sessionID[:8], "error", err)
+		}
 	}
 
 	RemoveConfig(sessionID)
@@ -353,8 +408,15 @@ func (d *Daemon) updateStatus(ctx context.Context, sessionID, status, containerI
 		SshEndpoint: sshEndpoint,
 	}
 
-	if _, err := d.client.UpdateSessionStatus(ctx, req); err != nil {
-		log.Printf("session %s: status update failed: %v", sessionID[:8], err)
+	err := retry.Do(ctx, retry.Config{
+		MaxAttempts: 3, BaseDelay: 500 * time.Millisecond,
+		MaxDelay: 5 * time.Second, Jitter: 0.3,
+	}, func(ctx context.Context) error {
+		_, err := d.client.UpdateSessionStatus(ctx, req)
+		return err
+	})
+	if err != nil {
+		d.log.Warn("status update failed after retries", "session_id", sessionID[:8], "error", err)
 	}
 }
 
@@ -362,6 +424,17 @@ func (d *Daemon) activeSessionCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(d.sessions)
+}
+
+// parseTunnelIndex extracts the third octet from a tunnel IP (e.g. "10.99.3.1" -> 3).
+// Returns 0 if the IP is empty or malformed, which causes the WG port to equal the base port.
+func parseTunnelIndex(ip string) int {
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return 0
+	}
+	n, _ := strconv.Atoi(parts[2])
+	return n
 }
 
 func (d *Daemon) cleanup(ctx context.Context) {

@@ -2,14 +2,14 @@ package nat
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net"
 )
 
 // RunSTUNServer listens on the given UDP address and echoes back the
 // observed source IP:port to callers. This is a minimal STUN-like service
 // (not RFC 5389 compliant) used only for endpoint discovery.
-func RunSTUNServer(ctx context.Context, listenAddr string) error {
+func RunSTUNServer(ctx context.Context, listenAddr string, log *slog.Logger) error {
 	addr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return err
@@ -21,7 +21,7 @@ func RunSTUNServer(ctx context.Context, listenAddr string) error {
 	}
 	defer conn.Close()
 
-	log.Printf("stun server listening on %s", listenAddr)
+	log.Info("stun server listening", "addr", listenAddr)
 
 	go func() {
 		<-ctx.Done()
@@ -36,7 +36,7 @@ func RunSTUNServer(ctx context.Context, listenAddr string) error {
 			case <-ctx.Done():
 				return nil
 			default:
-				log.Printf("stun read error: %v", err)
+				log.Warn("stun read error", "error", err)
 				continue
 			}
 		}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,8 +15,10 @@ import (
 
 	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
 	"github.com/OpenStruct/peer_compute/internal/agent"
+	"github.com/OpenStruct/peer_compute/internal/logging"
 	"github.com/OpenStruct/peer_compute/internal/nat"
 	"github.com/OpenStruct/peer_compute/internal/relay"
+	"github.com/OpenStruct/peer_compute/internal/retry"
 )
 
 var (
@@ -119,13 +120,14 @@ var connectSessionCmd = &cobra.Command{
 
 func doConnect(client computev1.RegistryServiceClient, sessionID string, kp *agent.WGKeyPair) error {
 	ctx := context.Background()
+	log := logging.New("cli")
 	wgPort := 51821 // renter WG port
 
 	// 1. Gather candidates
 	fmt.Println("Discovering network endpoints...")
-	candidates, err := nat.GatherCandidates(ctx, flagSTUN, wgPort)
+	candidates, err := nat.GatherCandidates(ctx, flagSTUN, wgPort, log)
 	if err != nil {
-		log.Printf("candidate gathering: %v", err)
+		log.Warn("candidate gathering failed", "error", err)
 	}
 
 	protoCandidates := make([]*computev1.EndpointCandidate, len(candidates))
@@ -149,11 +151,13 @@ func doConnect(client computev1.RegistryServiceClient, sessionID string, kp *age
 		return fmt.Errorf("candidate exchange: %w", err)
 	}
 
-	// If no peer candidates yet, poll briefly
+	// If no peer candidates yet, poll with backoff
 	if len(exchResp.PeerCandidates) == 0 {
 		fmt.Println("Waiting for provider to submit candidates...")
-		for i := 0; i < 10; i++ {
-			time.Sleep(2 * time.Second)
+		retry.Do(ctx, retry.Config{
+			MaxAttempts: 10, BaseDelay: 1 * time.Second,
+			MaxDelay: 5 * time.Second, Jitter: 0.2,
+		}, func(ctx context.Context) error {
 			exchResp, err = client.ExchangeCandidates(ctx, &computev1.ExchangeCandidatesRequest{
 				SessionId:   sessionID,
 				PeerId:      "cli-user",
@@ -163,10 +167,11 @@ func doConnect(client computev1.RegistryServiceClient, sessionID string, kp *age
 			if err != nil {
 				return err
 			}
-			if len(exchResp.PeerCandidates) > 0 {
-				break
+			if len(exchResp.PeerCandidates) == 0 {
+				return fmt.Errorf("no peer candidates yet")
 			}
-		}
+			return nil
+		})
 	}
 
 	peerWGKey := exchResp.GetPeerWgPublicKey()
@@ -185,7 +190,7 @@ func doConnect(client computev1.RegistryServiceClient, sessionID string, kp *age
 			}
 		}
 
-		addr, err := nat.Probe(ctx, wgPort, remoteCandidates, 10*time.Second)
+		addr, err := nat.Probe(ctx, wgPort, remoteCandidates, 10*time.Second, log)
 		if err == nil {
 			peerEndpoint = addr
 			connMode = "holepunch"
@@ -198,7 +203,7 @@ func doConnect(client computev1.RegistryServiceClient, sessionID string, kp *age
 	// 4. Relay fallback
 	if connMode == "" && exchResp.GetRelayAddress() != "" {
 		proxyPort := wgPort + 10000
-		rc, err := relay.NewRelayClient(exchResp.RelayAddress, exchResp.RelayToken, proxyPort, wgPort)
+		rc, err := relay.NewRelayClient(exchResp.RelayAddress, exchResp.RelayToken, proxyPort, wgPort, log)
 		if err != nil {
 			return fmt.Errorf("relay client: %w", err)
 		}
@@ -232,13 +237,26 @@ func doConnect(client computev1.RegistryServiceClient, sessionID string, kp *age
 		})
 	}
 
-	// 5. Write WireGuard config
+	// 5. Fetch session to get allocated tunnel IPs
+	sessResp, err := client.GetSession(ctx, &computev1.GetSessionRequest{SessionId: sessionID})
+	renterIP := "10.99.0.2"
+	providerIP := "10.99.0.1"
+	if err == nil && sessResp.Session != nil {
+		if sessResp.Session.WgRenterIp != "" {
+			renterIP = sessResp.Session.WgRenterIp
+		}
+		if sessResp.Session.WgProviderIp != "" {
+			providerIP = sessResp.Session.WgProviderIp
+		}
+	}
+
+	// 6. Write WireGuard config with per-session tunnel IPs
 	confPath, err := agent.WriteConfig(sessionID, agent.WGConfig{
 		PrivateKey:    kp.PrivateKey,
-		TunnelIP:      "10.99.0.2",
+		TunnelIP:      renterIP,
 		ListenPort:    wgPort,
 		PeerPublicKey: peerWGKey,
-		PeerIP:        "10.99.0.1",
+		PeerIP:        providerIP,
 		PeerEndpoint:  peerEndpoint,
 	})
 	if err != nil {
@@ -247,16 +265,41 @@ func doConnect(client computev1.RegistryServiceClient, sessionID string, kp *age
 
 	fmt.Printf("\nConnection established (%s)\n", connMode)
 	fmt.Printf("WireGuard config: %s\n", confPath)
-	fmt.Printf("Activate with:    sudo wg-quick up %s\n", confPath)
-	fmt.Printf("Tunnel IP:        10.99.0.2 -> 10.99.0.1 (provider)\n")
 
-	if connMode == "relay" {
-		fmt.Println("\nRelay is active. Keep this process running to maintain the tunnel.")
-		// Block until interrupt
+	var tunnelActive bool
+	if !agent.HasWGQuick() {
+		fmt.Printf("Activate with:    sudo wg-quick up %s\n", confPath)
+		fmt.Println("Note: wg-quick not found on PATH. Install wireguard-tools to enable auto-activation.")
+	} else if !agent.IsRoot() {
+		fmt.Printf("Activate with:    sudo wg-quick up %s\n", confPath)
+		fmt.Println("Note: Auto-activation requires root privileges. Re-run with sudo or activate manually.")
+	} else {
+		iface, err := agent.WGUp(context.Background(), confPath, log)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: WireGuard auto-activation failed: %v\n", err)
+			fmt.Printf("Activate manually: sudo wg-quick up %s\n", confPath)
+		} else {
+			fmt.Printf("Tunnel active:    %s\n", iface)
+			tunnelActive = true
+		}
+	}
+
+	fmt.Printf("Tunnel IP:        %s -> %s (provider)\n", renterIP, providerIP)
+
+	// Block until interrupt when relay is active or tunnel is up
+	if connMode == "relay" || tunnelActive {
+		if connMode == "relay" {
+			fmt.Println("\nRelay is active. Keep this process running to maintain the tunnel.")
+		}
+		fmt.Println("Press Ctrl+C to disconnect.")
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
 		fmt.Println("\nDisconnecting...")
+
+		if tunnelActive {
+			agent.WGDown(context.Background(), confPath, log)
+		}
 	}
 
 	return nil
