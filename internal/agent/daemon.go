@@ -28,6 +28,8 @@ type Config struct {
 	CPUCores          uint32
 	MemoryMB          uint64
 	DiskGB            uint64
+	GPUCount          uint32
+	GPUModel          string
 	WGListenPort      int    // base port for WireGuard tunnels
 	STUNAddr          string // registry STUN endpoint (e.g. registry:3478)
 	RelayAddr         string // registry relay endpoint (e.g. registry:3479)
@@ -104,6 +106,8 @@ func (d *Daemon) register(ctx context.Context) error {
 			CpuCores: d.cfg.CPUCores,
 			MemoryMb: d.cfg.MemoryMB,
 			DiskGb:   d.cfg.DiskGB,
+			GpuCount: d.cfg.GPUCount,
+			GpuModel: d.cfg.GPUModel,
 		},
 	})
 	if err != nil {

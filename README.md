@@ -1,163 +1,182 @@
 # Peer Compute
 
-Rent compute from anyone's machine. An open-source, self-hostable peer-to-peer compute marketplace.
+Open-source peer-to-peer compute framework. Enables providers to share compute resources (CPU, memory, GPU) with renters over encrypted WireGuard tunnels.
 
-Providers share their CPU/GPU resources. Renters discover available machines and spin up sandboxed containers in seconds. Connections work across NATs and firewalls — no port forwarding required.
+## Features
 
-## How it works
-
-```
-Renter                      Registry                     Provider
-  │                            │                            │
-  │  1. Find a provider        │                            │
-  │  peerctl providers         │                            │
-  │<────────────────────────── │ ──────────────────────────>│
-  │                            │         agent heartbeats   │
-  │  2. Create a session       │                            │
-  │  peerctl session create    │                            │
-  │──────────────────────────> │ ──────────────────────────>│
-  │                            │    agent picks up session, │
-  │                            │    starts Docker container │
-  │                            │                            │
-  │  3. Connect                │                            │
-  │  peerctl session connect   │                            │
-  │──── STUN discover ───────>│<──── STUN discover ────────│
-  │──── exchange candidates ──>│<── exchange candidates ────│
-  │                            │                            │
-  │  4. Tunnel established (WireGuard)                      │
-  │<════════════════════════════════════════════════════════>│
-  │         direct (hole-punch) or relayed                  │
-```
-
-## Quick start
-
-**Prerequisites:** Go 1.23+, Docker, protoc
-
-```bash
-# Build everything
-make build
-
-# Terminal 1: Start the registry
-./bin/registry
-
-# Terminal 2: Start a provider
-./bin/agent
-
-# Terminal 3: Use compute
-./bin/peerctl providers
-./bin/peerctl session create --provider <id> --image ubuntu:22.04
-./bin/peerctl session connect <session-id>
-```
+- Provider registration and discovery via gRPC registry
+- Automatic NAT traversal (STUN + UDP hole-punching + relay fallback)
+- Encrypted tunnels using WireGuard
+- Docker container orchestration for compute sessions
+- Pluggable authentication, reputation, and storage backends
+- CLI for both providers (agent) and renters (peerctl)
 
 ## Architecture
 
-Three binaries, one repo:
-
-| Binary | Role |
-|--------|------|
-| `registry` | Central coordination server. Brokers discovery, handles STUN/relay for NAT traversal. |
-| `agent` | Provider daemon. Registers machine resources, runs sandboxed containers for renters. |
-| `peerctl` | Renter CLI. Discover providers, create sessions, establish tunnels. |
-
-### Networking
-
-Connections between renter and provider work in three modes, tried in order:
-
-1. **Direct** — Both on the same network or with open ports.
-2. **Hole-punch** — UDP hole-punching via STUN discovery. Works for most NAT types.
-3. **Relay** — Encrypted WireGuard traffic proxied through the registry. Fallback for symmetric NAT.
-
-The registry runs three listeners:
-
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 50051 | TCP | gRPC API |
-| 3478 | UDP | STUN (endpoint discovery) |
-| 3479 | UDP | Relay (NAT fallback) |
-
-### Sandboxing
-
-Provider containers run with:
-- CPU limits (`--cpus`)
-- Memory limits (`--memory`)
-- Session labels for lifecycle tracking
-
-## Project structure
+Peer Compute is built around three binaries that communicate over gRPC and UDP:
 
 ```
-cmd/
-  registry/       Registry server entry point
-  agent/          Provider agent entry point
-  peerctl/        Renter CLI entry point
-internal/
-  registry/       gRPC server, session + provider store
-  agent/          Docker runner, WireGuard tunnel, daemon loop
-  cli/            Cobra commands (providers, session create/connect/get/terminate)
-  nat/            STUN client/server, candidate gathering, UDP hole-punching
-  relay/          UDP relay server + client for symmetric NAT fallback
-proto/
-  compute/v1/     Protobuf service definitions
+                    ┌─────────────────────────────┐
+                    │          Registry            │
+                    │  gRPC :50051                 │
+                    │  STUN :3478  Relay :3479     │
+                    └──────┬──────────────┬────────┘
+                           │              │
+              gRPC + STUN  │              │  gRPC + STUN
+                           │              │
+                    ┌──────▼──────┐ ┌─────▼───────┐
+                    │    Agent    │ │   peerctl    │
+                    │ (Provider)  │ │  (Renter)    │
+                    └──────┬──────┘ └─────┬────────┘
+                           │              │
+                           └──── WireGuard ───┘
+                            Encrypted Tunnel
+```
+
+- **Registry** -- Central coordination server handling provider discovery, STUN signaling, and relay fallback.
+- **Agent** -- Runs on provider machines. Advertises available resources to the registry and manages Docker containers for compute sessions.
+- **peerctl** -- CLI tool for renters to browse providers, create sessions, and connect to compute resources.
+
+## Quick Start
+
+### Prerequisites
+
+- Go 1.25+
+- Docker (for providers)
+- WireGuard (optional, for tunnel connections)
+
+### Build
+
+```bash
+make build
+```
+
+This produces three binaries in `bin/`:
+
+- `bin/registry`
+- `bin/agent`
+- `bin/peerctl`
+
+### Start the Registry
+
+```bash
+./bin/registry
+```
+
+Defaults: gRPC on `:50051`, STUN on `:3478`, Relay on `:3479`.
+
+### Start a Provider
+
+```bash
+./bin/agent
+```
+
+The agent connects to the registry and advertises the machine's available compute resources.
+
+### Rent Compute
+
+List available providers:
+
+```bash
+./bin/peerctl providers
+```
+
+Create a session and connect:
+
+```bash
+./bin/peerctl session create --provider <id> --image ubuntu:22.04 --connect
 ```
 
 ## Configuration
 
-All configuration via environment variables:
-
-### Registry
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `50051` | gRPC listen port |
-| `STUN_PORT` | `3478` | STUN UDP port |
-| `RELAY_PORT` | `3479` | Relay UDP port |
+|---|---|---|
+| `PORT` | `50051` | gRPC server listen port |
+| `STUN_PORT` | `3478` | STUN UDP listen port |
+| `RELAY_PORT` | `3479` | Relay UDP listen port |
+| `DATABASE_URL` | (none) | PostgreSQL connection string (optional, for persistent storage) |
+| `REGISTRY_ADDR` | `localhost:50051` | Registry address for agent and peerctl to connect to |
+| `PROVIDER_NAME` | hostname | Human-readable name for the provider |
+| `PROVIDER_ADDR` | auto-detected | Public address the provider advertises to the registry |
 
-### Agent
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REGISTRY_ADDR` | `localhost:50051` | Registry gRPC address |
-| `PROVIDER_NAME` | hostname | Display name for this provider |
-| `PROVIDER_ADDR` | `localhost:50052` | Advertised address |
-| `STUN_ADDR` | `<registry>:3478` | STUN server address |
-| `RELAY_ADDR` | `<registry>:3479` | Relay server address |
+## gRPC API
 
-### CLI
+The registry exposes a single gRPC service with RPCs grouped by function:
+
+### Provider Management
+
+- `RegisterProvider` -- Register a new provider with resource information
+- `UnregisterProvider` -- Remove a provider from the registry
+- `Heartbeat` -- Periodic liveness signal from a provider
+- `ListProviders` -- Query available providers with optional filters
+- `GetProvider` -- Retrieve details for a specific provider
+
+### Session Management
+
+- `CreateSession` -- Request a compute session on a specific provider
+- `EndSession` -- Terminate an active session
+- `GetSession` -- Retrieve session status and metadata
+- `ListSessions` -- List sessions for a provider or renter
+
+### NAT Traversal
+
+- `GetSTUNInfo` -- Retrieve STUN server information for NAT discovery
+- `ExchangeCandidates` -- Exchange ICE-style connectivity candidates between peers
+- `AllocateRelay` -- Request a relay allocation when direct connectivity fails
+
+## Plugin System
+
+Peer Compute is designed for extensibility through three core interfaces:
+
+- **Authenticator** -- Controls access to registry RPCs. Implement custom authentication schemes (JWT, API keys, mTLS).
+- **Reputation** -- Scores providers and renters based on session outcomes. Plug in custom scoring algorithms.
+- **Store** -- Persists providers, sessions, and metadata. Swap the default in-memory store for any backend.
+
+Inject custom implementations using `plugin.Bundle` and `serve.RegistryConfig`:
+
+```go
+package main
+
+import (
+    "github.com/OpenStruct/peer_compute/plugin"
+    "github.com/OpenStruct/peer_compute/serve"
+)
+
+func main() {
+    bundle := plugin.Bundle{
+        Authenticator: &MyCustomAuth{},
+        Reputation:    &MyCustomReputation{},
+        Store:         &MyCustomStore{},
+    }
+
+    cfg := serve.RegistryConfig{
+        GRPCPort:  50051,
+        STUNPort:  3478,
+        RelayPort: 3479,
+        Plugins:   bundle,
+    }
+
+    serve.StartRegistry(cfg)
+}
+```
+
+Any field left `nil` in the bundle falls back to the default in-memory implementation.
+
+## Docker
+
 ```bash
-peerctl --registry localhost:50051 providers
-peerctl session create --provider <id> --image pytorch/pytorch --cpu 4 --memory 8192 --connect
-peerctl session connect <session-id> --stun localhost:3478
-peerctl session get <session-id>
-peerctl session terminate <session-id>
+docker compose up -d   # postgres + redis + registry
 ```
 
 ## Development
 
 ```bash
-# Generate protobuf code
-make proto
-
-# Build all binaries
-make build
-
-# Run tests
-make test
-
-# Start backing services (Postgres + Redis for future use)
-make dev
-
-# Lint
-make lint
+make proto       # regenerate protobuf
+make build       # compile binaries
+make test        # run tests
+make lint        # run linter
 ```
-
-## Roadmap
-
-- [ ] GPU support (NVIDIA Container Toolkit / MIG)
-- [ ] PostgreSQL + Redis persistent store
-- [ ] Reputation system for providers and renters
-- [ ] Web UI (Next.js)
-- [ ] `wg-quick` auto-activation
-- [ ] Multi-session WireGuard (per-session tunnel IPs)
-- [ ] Encrypted volume mounts for sensitive workloads
-- [ ] NATS job queue for session assignment
 
 ## License
 
-MIT
+Apache 2.0. See [LICENSE](LICENSE) for details.
