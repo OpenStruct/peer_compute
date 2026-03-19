@@ -1,5 +1,4 @@
 bin/
-gen/
 .env
 .DS_Store
 .idea/
