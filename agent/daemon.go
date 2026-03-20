@@ -21,8 +21,10 @@ import (
 
 type Config struct {
 	Name              string
-	Address           string // host:port advertised to renters
-	RegistryConn      *grpc.ClientConn
+	Address           string         // host:port advertised to renters
+	Token             string         // API key for authenticated registration (optional)
+	RegistryConn      *grpc.ClientConn // used when Client is nil (gRPC mode)
+	Client            RegistryClient // if set, used directly (REST mode)
 	HeartbeatInterval time.Duration
 	PollInterval      time.Duration
 	CPUCores          uint32
@@ -37,7 +39,7 @@ type Config struct {
 
 type Daemon struct {
 	cfg      Config
-	client   computev1.RegistryServiceClient
+	client   RegistryClient
 	runner   *ContainerRunner
 	provider *computev1.Provider
 	token    string
@@ -70,9 +72,14 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		return nil, fmt.Errorf("docker: %w", err)
 	}
 
+	client := cfg.Client
+	if client == nil {
+		client = NewGRPCClient(cfg.RegistryConn)
+	}
+
 	return &Daemon{
 		cfg:      cfg,
-		client:   computev1.NewRegistryServiceClient(cfg.RegistryConn),
+		client:   client,
 		runner:   runner,
 		sessions: make(map[string]*runningSession),
 		log:      log,

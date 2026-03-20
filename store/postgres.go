@@ -1,23 +1,28 @@
-// Package store implements plugin.Store backed by PostgreSQL.
+// Package store provides a PostgreSQL-backed implementation of plugin.Store.
+// This is a public package intended for use by both the open-source registry
+// and downstream projects (e.g. peer_compute_pro).
 package store
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 
+	sq "github.com/Masterminds/squirrel"
 	_ "github.com/lib/pq"
 
 	"github.com/OpenStruct/peer_compute/plugin"
 )
+
+// psql is a squirrel statement builder configured for PostgreSQL $1-style placeholders.
+var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
 // PostgresStore implements plugin.Store using PostgreSQL.
 type PostgresStore struct {
 	db *sql.DB
 }
 
-// New opens a PostgreSQL connection and returns a Store.
+// New opens a PostgreSQL connection and returns a PostgresStore.
 func New(dsn string) (*PostgresStore, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -31,7 +36,13 @@ func New(dsn string) (*PostgresStore, error) {
 	return &PostgresStore{db: db}, nil
 }
 
-// DB exposes the underlying *sql.DB for external use (e.g., running migrations).
+// NewFromDB wraps an existing *sql.DB. Intended for testing with sqlmock.
+func NewFromDB(db *sql.DB) *PostgresStore {
+	return &PostgresStore{db: db}
+}
+
+// DB exposes the underlying *sql.DB for callers that need direct access
+// (e.g. running migrations, billing queries).
 func (s *PostgresStore) DB() *sql.DB { return s.db }
 
 func (s *PostgresStore) Close() error { return s.db.Close() }
@@ -68,7 +79,6 @@ func (s *PostgresStore) GetProvider(ctx context.Context, id string) (*plugin.Pro
 }
 
 func (s *PostgresStore) GetProviderByPrefix(ctx context.Context, prefix string) (*plugin.ProviderRecord, error) {
-	// Try exact match first
 	p, err := s.GetProvider(ctx, prefix)
 	if err == nil {
 		return p, nil
@@ -87,14 +97,14 @@ func (s *PostgresStore) GetProviderByPrefix(ctx context.Context, prefix string) 
 
 	var match *plugin.ProviderRecord
 	for rows.Next() {
-		p := &plugin.ProviderRecord{}
-		if err := scanProviderRow(rows, p); err != nil {
+		rec := &plugin.ProviderRecord{}
+		if err := scanProviderRow(rows, rec); err != nil {
 			return nil, err
 		}
 		if match != nil {
 			return nil, plugin.ErrAmbiguousPrefix
 		}
-		match = p
+		match = rec
 	}
 	if match == nil {
 		return nil, plugin.ErrNotFound
@@ -103,37 +113,25 @@ func (s *PostgresStore) GetProviderByPrefix(ctx context.Context, prefix string) 
 }
 
 func (s *PostgresStore) ListProviders(ctx context.Context, filter plugin.ProviderFilter) ([]*plugin.ProviderRecord, error) {
-	var where []string
-	var args []any
-	n := 1
+	qb := psql.Select("id, name, address, public_address, status, cpu_cores, memory_mb, disk_gb, gpu_count, gpu_model, avail_cpu, avail_memory_mb, avail_gpu, registered_at, last_heartbeat").
+		From("providers")
 
 	if filter.Status != "" {
-		where = append(where, fmt.Sprintf("status = $%d", n))
-		args = append(args, filter.Status)
-		n++
+		qb = qb.Where(sq.Eq{"status": filter.Status})
 	}
 	if filter.MinCPU > 0 {
-		where = append(where, fmt.Sprintf("avail_cpu >= $%d", n))
-		args = append(args, filter.MinCPU)
-		n++
+		qb = qb.Where(sq.GtOrEq{"avail_cpu": filter.MinCPU})
 	}
 	if filter.MinMemory > 0 {
-		where = append(where, fmt.Sprintf("avail_memory_mb >= $%d", n))
-		args = append(args, filter.MinMemory)
-		n++
+		qb = qb.Where(sq.GtOrEq{"avail_memory_mb": filter.MinMemory})
 	}
 	if filter.MinGPU > 0 {
-		where = append(where, fmt.Sprintf("avail_gpu >= $%d", n))
-		args = append(args, filter.MinGPU)
-		n++
+		qb = qb.Where(sq.GtOrEq{"avail_gpu": filter.MinGPU})
 	}
 
-	q := `SELECT id, name, address, public_address, status,
-		cpu_cores, memory_mb, disk_gb, gpu_count, gpu_model,
-		avail_cpu, avail_memory_mb, avail_gpu,
-		registered_at, last_heartbeat FROM providers`
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
+	q, args, err := qb.ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build provider query: %w", err)
 	}
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -165,7 +163,8 @@ func (s *PostgresStore) PutSession(ctx context.Context, sess *plugin.SessionReco
 		INSERT INTO sessions (id, provider_id, renter_id, image, status,
 			container_id, ssh_endpoint, connection_mode, relay_token,
 			wg_public_key, wg_endpoint, wg_provider_ip, wg_renter_ip,
-			cpu_cores, memory_mb, created_at, terminated_at)
+			cpu_cores, memory_mb,
+			created_at, terminated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		ON CONFLICT (id) DO UPDATE SET
 			status=EXCLUDED.status, container_id=EXCLUDED.container_id,
@@ -176,7 +175,8 @@ func (s *PostgresStore) PutSession(ctx context.Context, sess *plugin.SessionReco
 		sess.ID, sess.ProviderID, sess.RenterID, sess.Image, sess.Status,
 		sess.ContainerID, sess.SSHEndpoint, sess.ConnectionMode, sess.RelayToken,
 		sess.WGPublicKey, sess.WGEndpoint, sess.WGProviderIP, sess.WGRenterIP,
-		sess.CPUCores, sess.MemoryMB, sess.CreatedAt, sess.TerminatedAt)
+		sess.CPUCores, sess.MemoryMB,
+		sess.CreatedAt, sess.TerminatedAt)
 	return err
 }
 
@@ -185,7 +185,8 @@ func (s *PostgresStore) GetSession(ctx context.Context, id string) (*plugin.Sess
 		`SELECT id, provider_id, renter_id, image, status,
 			container_id, ssh_endpoint, connection_mode, relay_token,
 			wg_public_key, wg_endpoint, wg_provider_ip, wg_renter_ip,
-			cpu_cores, memory_mb, created_at, terminated_at
+			cpu_cores, memory_mb,
+			created_at, terminated_at
 		FROM sessions WHERE id = $1`, id))
 }
 
@@ -199,7 +200,8 @@ func (s *PostgresStore) GetSessionByPrefix(ctx context.Context, prefix string) (
 		`SELECT id, provider_id, renter_id, image, status,
 			container_id, ssh_endpoint, connection_mode, relay_token,
 			wg_public_key, wg_endpoint, wg_provider_ip, wg_renter_ip,
-			cpu_cores, memory_mb, created_at, terminated_at
+			cpu_cores, memory_mb,
+			created_at, terminated_at
 		FROM sessions WHERE id LIKE $1 LIMIT 2`, prefix+"%")
 	if err != nil {
 		return nil, err
@@ -224,32 +226,22 @@ func (s *PostgresStore) GetSessionByPrefix(ctx context.Context, prefix string) (
 }
 
 func (s *PostgresStore) ListSessions(ctx context.Context, filter plugin.SessionFilter) ([]*plugin.SessionRecord, error) {
-	var where []string
-	var args []any
-	n := 1
+	qb := psql.Select("id, provider_id, renter_id, image, status, container_id, ssh_endpoint, connection_mode, relay_token, wg_public_key, wg_endpoint, wg_provider_ip, wg_renter_ip, cpu_cores, memory_mb, created_at, terminated_at").
+		From("sessions")
 
 	if filter.ProviderID != "" {
-		where = append(where, fmt.Sprintf("provider_id = $%d", n))
-		args = append(args, filter.ProviderID)
-		n++
+		qb = qb.Where(sq.Eq{"provider_id": filter.ProviderID})
 	}
 	if filter.RenterID != "" {
-		where = append(where, fmt.Sprintf("renter_id = $%d", n))
-		args = append(args, filter.RenterID)
-		n++
+		qb = qb.Where(sq.Eq{"renter_id": filter.RenterID})
 	}
 	if filter.Status != "" {
-		where = append(where, fmt.Sprintf("status = $%d", n))
-		args = append(args, filter.Status)
-		n++
+		qb = qb.Where(sq.Eq{"status": filter.Status})
 	}
 
-	q := `SELECT id, provider_id, renter_id, image, status,
-		container_id, ssh_endpoint, connection_mode, relay_token,
-		wg_public_key, wg_endpoint, wg_provider_ip, wg_renter_ip,
-		cpu_cores, memory_mb, created_at, terminated_at FROM sessions`
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
+	q, args, err := qb.ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build session query: %w", err)
 	}
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -303,7 +295,8 @@ func (s *PostgresStore) scanSession(row *sql.Row) (*plugin.SessionRecord, error)
 		&rec.ID, &rec.ProviderID, &rec.RenterID, &rec.Image, &rec.Status,
 		&rec.ContainerID, &rec.SSHEndpoint, &rec.ConnectionMode, &rec.RelayToken,
 		&rec.WGPublicKey, &rec.WGEndpoint, &rec.WGProviderIP, &rec.WGRenterIP,
-		&rec.CPUCores, &rec.MemoryMB, &rec.CreatedAt, &rec.TerminatedAt)
+		&rec.CPUCores, &rec.MemoryMB,
+		&rec.CreatedAt, &rec.TerminatedAt)
 	if err == sql.ErrNoRows {
 		return nil, plugin.ErrNotFound
 	}
@@ -315,5 +308,6 @@ func scanSessionRow(rows *sql.Rows, rec *plugin.SessionRecord) error {
 		&rec.ID, &rec.ProviderID, &rec.RenterID, &rec.Image, &rec.Status,
 		&rec.ContainerID, &rec.SSHEndpoint, &rec.ConnectionMode, &rec.RelayToken,
 		&rec.WGPublicKey, &rec.WGEndpoint, &rec.WGProviderIP, &rec.WGRenterIP,
-		&rec.CPUCores, &rec.MemoryMB, &rec.CreatedAt, &rec.TerminatedAt)
+		&rec.CPUCores, &rec.MemoryMB,
+		&rec.CreatedAt, &rec.TerminatedAt)
 }

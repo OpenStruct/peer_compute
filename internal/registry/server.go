@@ -175,6 +175,13 @@ func (s *Server) RegisterProvider(ctx context.Context, req *computev1.RegisterPr
 		return nil, storeErr(err)
 	}
 
+	// Notify plugin if it implements RegistrationHook (e.g. to link provider to user).
+	if hook, ok := s.plugins.Auth.(plugin.RegistrationHook); ok {
+		if err := hook.OnProviderRegistered(ctx, id); err != nil {
+			return nil, status.Errorf(codes.Internal, "registration hook: %v", err)
+		}
+	}
+
 	return &computev1.RegisterProviderResponse{
 		Provider: providerToProto(rec),
 		Token:    "tok_" + id,

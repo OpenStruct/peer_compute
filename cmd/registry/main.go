@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/OpenStruct/peer_compute/internal/store"
 	"github.com/OpenStruct/peer_compute/plugin"
 	"github.com/OpenStruct/peer_compute/serve"
+	"github.com/OpenStruct/peer_compute/store"
 )
 
 func main() {

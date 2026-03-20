@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
-	"github.com/OpenStruct/peer_compute/internal/agent"
+	"github.com/OpenStruct/peer_compute/agent"
 	"github.com/OpenStruct/peer_compute/internal/logging"
 	"github.com/OpenStruct/peer_compute/internal/nat"
 	"github.com/OpenStruct/peer_compute/internal/relay"

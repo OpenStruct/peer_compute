@@ -18,8 +18,15 @@ build: proto
 	go build -o bin/agent ./cmd/agent
 	go build -o bin/peerctl ./cmd/peerctl
 
+agent-cross:
+	GOOS=darwin GOARCH=arm64 go build -o bin/pcp-agent-darwin-arm64 ./cmd/agent
+	GOOS=darwin GOARCH=amd64 go build -o bin/pcp-agent-darwin-amd64 ./cmd/agent
+	GOOS=linux GOARCH=amd64 go build -o bin/pcp-agent-linux-amd64 ./cmd/agent
+	GOOS=linux GOARCH=arm64 go build -o bin/pcp-agent-linux-arm64 ./cmd/agent
+
 test:
 	go test ./...
+
 
 clean:
 	rm -rf bin/ $(GEN_DIR)/

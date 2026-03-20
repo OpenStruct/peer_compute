@@ -15,6 +15,13 @@ type Authenticator interface {
 	Issue(ctx context.Context, userID string) (token string, err error)
 }
 
+// RegistrationHook is an optional interface that Authenticator implementations
+// may implement to be notified when a provider registers via gRPC.
+// This allows linking the gRPC provider record to a web user account.
+type RegistrationHook interface {
+	OnProviderRegistered(ctx context.Context, providerID string) error
+}
+
 // Reputation scores providers and renters.
 type Reputation interface {
 	// ProviderScore returns a trust score (0-100) for a provider.
