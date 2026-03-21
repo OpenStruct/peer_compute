@@ -42,7 +42,7 @@ func GenerateKeyPair() (*WGKeyPair, error) {
 
 const wgConfTmpl = `[Interface]
 PrivateKey = {{.PrivateKey}}
-Address = {{.TunnelIP}}/24
+Address = {{.TunnelIP}}/31
 ListenPort = {{.ListenPort}}
 
 [Peer]

@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -19,27 +20,124 @@ func newTestServer() *Server {
 
 func TestAllocateTunnelIPs_Sequential(t *testing.T) {
 	s := newTestServer()
-	pIP1, rIP1 := s.allocateTunnelIPs("sess-1")
+	pIP1, rIP1, err := s.allocateTunnelIPs("sess-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if pIP1 != "10.99.1.1" || rIP1 != "10.99.1.2" {
 		t.Errorf("first allocation = (%q, %q), want (10.99.1.1, 10.99.1.2)", pIP1, rIP1)
 	}
-	pIP2, rIP2 := s.allocateTunnelIPs("sess-2")
+	pIP2, rIP2, err := s.allocateTunnelIPs("sess-2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if pIP2 != "10.99.2.1" || rIP2 != "10.99.2.2" {
 		t.Errorf("second allocation = (%q, %q), want (10.99.2.1, 10.99.2.2)", pIP2, rIP2)
 	}
 }
 
-func TestAllocateTunnelIPs_WrapsAt254(t *testing.T) {
+func TestAllocateTunnelIPs_WrapsMinorAt254(t *testing.T) {
 	s := newTestServer()
-	s.nextTunnelIdx = 254
-	pIP, rIP := s.allocateTunnelIPs("sess-wrap")
+	// Set hint to last minor in first major subnet
+	s.nextTunnelHint = tunnelIndex{Major: 99, Minor: 254}
+	pIP, rIP, err := s.allocateTunnelIPs("sess-wrap")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if pIP != "10.99.254.1" || rIP != "10.99.254.2" {
 		t.Errorf("allocation at 254 = (%q, %q), want (10.99.254.1, 10.99.254.2)", pIP, rIP)
 	}
-	// After 254, nextTunnelIdx should wrap to 1
-	pIP2, rIP2 := s.allocateTunnelIPs("sess-wrap2")
+	// After minor 254, should advance to next major subnet (100.1)
+	pIP2, rIP2, err := s.allocateTunnelIPs("sess-wrap2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pIP2 != "10.100.1.1" || rIP2 != "10.100.1.2" {
+		t.Errorf("wrapped allocation = (%q, %q), want (10.100.1.1, 10.100.1.2)", pIP2, rIP2)
+	}
+}
+
+func TestAllocateTunnelIPs_WrapsMajorAt126(t *testing.T) {
+	s := newTestServer()
+	// Set hint to last slot in the entire address space
+	s.nextTunnelHint = tunnelIndex{Major: 126, Minor: 254}
+	pIP, rIP, err := s.allocateTunnelIPs("sess-end")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pIP != "10.126.254.1" || rIP != "10.126.254.2" {
+		t.Errorf("allocation at end = (%q, %q), want (10.126.254.1, 10.126.254.2)", pIP, rIP)
+	}
+	// After last slot, should wrap to beginning (99.1)
+	pIP2, rIP2, err := s.allocateTunnelIPs("sess-restart")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if pIP2 != "10.99.1.1" || rIP2 != "10.99.1.2" {
 		t.Errorf("wrapped allocation = (%q, %q), want (10.99.1.1, 10.99.1.2)", pIP2, rIP2)
+	}
+}
+
+func TestAllocateTunnelIPs_SkipsUsedSlots(t *testing.T) {
+	s := newTestServer()
+	// Allocate first slot
+	_, _, err := s.allocateTunnelIPs("sess-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Allocate second slot
+	_, _, err = s.allocateTunnelIPs("sess-2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Reclaim first slot and reset hint to start
+	s.reclaimTunnelIndex("sess-1")
+	s.tunnelMu.Lock()
+	s.nextTunnelHint = tunnelIndex{Major: 99, Minor: 1}
+	s.tunnelMu.Unlock()
+
+	// Should reuse slot 99.1 since it was reclaimed
+	pIP, rIP, err := s.allocateTunnelIPs("sess-3")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pIP != "10.99.1.1" || rIP != "10.99.1.2" {
+		t.Errorf("reused allocation = (%q, %q), want (10.99.1.1, 10.99.1.2)", pIP, rIP)
+	}
+}
+
+func TestAllocateTunnelIPs_Exhausted(t *testing.T) {
+	s := newTestServer()
+	// Fill all slots
+	for i := 0; i < maxTunnelSlots; i++ {
+		_, _, err := s.allocateTunnelIPs(fmt.Sprintf("sess-%d", i))
+		if err != nil {
+			t.Fatalf("unexpected error at slot %d: %v", i, err)
+		}
+	}
+	// Next allocation should fail
+	_, _, err := s.allocateTunnelIPs("sess-overflow")
+	if err != ErrTunnelExhausted {
+		t.Errorf("expected ErrTunnelExhausted, got %v", err)
+	}
+}
+
+func TestAllocateTunnelIPs_ExhaustedThenReclaim(t *testing.T) {
+	s := newTestServer()
+	// Fill all slots
+	for i := 0; i < maxTunnelSlots; i++ {
+		_, _, err := s.allocateTunnelIPs(fmt.Sprintf("sess-%d", i))
+		if err != nil {
+			t.Fatalf("unexpected error at slot %d: %v", i, err)
+		}
+	}
+	// Reclaim one slot
+	s.reclaimTunnelIndex("sess-0")
+
+	// Should now succeed
+	_, _, err := s.allocateTunnelIPs("sess-new")
+	if err != nil {
+		t.Fatalf("expected allocation to succeed after reclaim, got %v", err)
 	}
 }
 
@@ -47,13 +145,29 @@ func TestAllocateTunnelIPs_WrapsAt254(t *testing.T) {
 
 func TestReclaimTunnelIndex(t *testing.T) {
 	s := newTestServer()
-	s.allocateTunnelIPs("sess-1")
+	_, _, err := s.allocateTunnelIPs("sess-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if _, ok := s.usedTunnelIdxs["sess-1"]; !ok {
 		t.Fatal("session not in usedTunnelIdxs after allocation")
 	}
 	s.reclaimTunnelIndex("sess-1")
 	if _, ok := s.usedTunnelIdxs["sess-1"]; ok {
 		t.Error("session still in usedTunnelIdxs after reclaim")
+	}
+	// Also verify the reverse map is cleaned up
+	if len(s.usedTunnelSet) != 0 {
+		t.Error("usedTunnelSet not empty after reclaiming only session")
+	}
+}
+
+func TestReclaimTunnelIndex_Idempotent(t *testing.T) {
+	s := newTestServer()
+	// Reclaiming a non-existent session should not panic
+	s.reclaimTunnelIndex("nonexistent")
+	if len(s.usedTunnelIdxs) != 0 || len(s.usedTunnelSet) != 0 {
+		t.Error("maps should be empty after reclaiming non-existent session")
 	}
 }
 

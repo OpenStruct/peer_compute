@@ -19,6 +19,24 @@ import (
 
 const heartbeatTimeout = 30 * time.Second
 
+// tunnelIndex represents a two-octet tunnel address: 10.{Major}.{Minor}.{role}.
+type tunnelIndex struct {
+	Major uint8 // 99–126
+	Minor uint8 // 1–254
+}
+
+const (
+	tunnelMajorMin = 99
+	tunnelMajorMax = 126
+	tunnelMinorMin = 1
+	tunnelMinorMax = 254
+	// maxTunnelSlots is (126-99+1) * (254-1+1) = 28 * 254 = 7112
+	maxTunnelSlots = int(tunnelMajorMax-tunnelMajorMin+1) * int(tunnelMinorMax-tunnelMinorMin+1)
+)
+
+// ErrTunnelExhausted is returned when all tunnel IP slots are in use.
+var ErrTunnelExhausted = errors.New("tunnel IP address space exhausted (all 7112 slots in use)")
+
 // Server implements the RegistryService gRPC server.
 type Server struct {
 	computev1.UnimplementedRegistryServiceServer
@@ -27,10 +45,13 @@ type Server struct {
 	mu         sync.RWMutex
 	candidates map[string]map[string]*candidateSet
 
-	// Tunnel IP allocation for multi-session WireGuard
+	// Tunnel IP allocation for multi-session WireGuard.
+	// Uses a two-octet address space: 10.{major}.{minor}.{role}
+	// major ranges 99-126, minor ranges 1-254, giving 7112 concurrent sessions.
 	tunnelMu       sync.Mutex
-	nextTunnelIdx  uint32            // starts at 1, wraps at 255
-	usedTunnelIdxs map[string]uint32 // sessionID -> tunnel index
+	nextTunnelHint tunnelIndex            // hint for where to start scanning
+	usedTunnelIdxs map[string]tunnelIndex // sessionID -> allocated index
+	usedTunnelSet  map[tunnelIndex]string // allocated index -> sessionID (reverse lookup)
 
 	relay   *relay.RelayServer
 	plugins *plugin.Bundle
@@ -52,8 +73,9 @@ func WithPlugins(b *plugin.Bundle) Option {
 func NewServer(relayServer *relay.RelayServer, opts ...Option) *Server {
 	s := &Server{
 		candidates:     make(map[string]map[string]*candidateSet),
-		nextTunnelIdx:  1,
-		usedTunnelIdxs: make(map[string]uint32),
+		nextTunnelHint: tunnelIndex{Major: tunnelMajorMin, Minor: tunnelMinorMin},
+		usedTunnelIdxs: make(map[string]tunnelIndex),
+		usedTunnelSet:  make(map[tunnelIndex]string),
 		relay:          relayServer,
 		plugins:        plugin.Defaults(),
 	}
@@ -63,26 +85,61 @@ func NewServer(relayServer *relay.RelayServer, opts ...Option) *Server {
 	return s
 }
 
-// allocateTunnelIPs assigns unique per-session tunnel IPs.
-func (s *Server) allocateTunnelIPs(sessionID string) (providerIP, renterIP string) {
+// advanceTunnel moves a tunnelIndex to the next slot, wrapping around the
+// two-octet address space (major: 99-126, minor: 1-254).
+func advanceTunnel(idx tunnelIndex) tunnelIndex {
+	idx.Minor++
+	if idx.Minor > tunnelMinorMax {
+		idx.Minor = tunnelMinorMin
+		idx.Major++
+		if idx.Major > tunnelMajorMax {
+			idx.Major = tunnelMajorMin
+		}
+	}
+	return idx
+}
+
+// allocateTunnelIPs assigns unique per-session tunnel IPs using a free-list
+// scan over the two-octet address space. Returns an error when all 7112
+// slots are in use.
+func (s *Server) allocateTunnelIPs(sessionID string) (providerIP, renterIP string, err error) {
 	s.tunnelMu.Lock()
 	defer s.tunnelMu.Unlock()
 
-	idx := s.nextTunnelIdx
-	s.nextTunnelIdx++
-	if s.nextTunnelIdx > 254 {
-		s.nextTunnelIdx = 1
+	if len(s.usedTunnelSet) >= maxTunnelSlots {
+		return "", "", ErrTunnelExhausted
 	}
-	s.usedTunnelIdxs[sessionID] = idx
 
-	return fmt.Sprintf("10.99.%d.1", idx), fmt.Sprintf("10.99.%d.2", idx)
+	// Scan from the hint position to find the next free slot.
+	candidate := s.nextTunnelHint
+	for {
+		if _, taken := s.usedTunnelSet[candidate]; !taken {
+			break
+		}
+		candidate = advanceTunnel(candidate)
+		// We already checked len < max above, so this loop will terminate.
+	}
+
+	// Record the allocation in both maps.
+	s.usedTunnelIdxs[sessionID] = candidate
+	s.usedTunnelSet[candidate] = sessionID
+
+	// Advance the hint past the slot we just allocated.
+	s.nextTunnelHint = advanceTunnel(candidate)
+
+	return fmt.Sprintf("10.%d.%d.1", candidate.Major, candidate.Minor),
+		fmt.Sprintf("10.%d.%d.2", candidate.Major, candidate.Minor), nil
 }
 
-// reclaimTunnelIndex frees a tunnel index when a session terminates.
+// reclaimTunnelIndex frees a tunnel index when a session terminates,
+// making it available for reuse by future sessions.
 func (s *Server) reclaimTunnelIndex(sessionID string) {
 	s.tunnelMu.Lock()
 	defer s.tunnelMu.Unlock()
-	delete(s.usedTunnelIdxs, sessionID)
+	if idx, ok := s.usedTunnelIdxs[sessionID]; ok {
+		delete(s.usedTunnelSet, idx)
+		delete(s.usedTunnelIdxs, sessionID)
+	}
 }
 
 // ── Conversions ────────────────────────────────────────────────────
@@ -268,7 +325,10 @@ func (s *Server) CreateSession(ctx context.Context, req *computev1.CreateSession
 	sessionID := uuid.NewString()
 
 	// Allocate per-session tunnel IPs
-	providerIP, renterIP := s.allocateTunnelIPs(sessionID)
+	providerIP, renterIP, err := s.allocateTunnelIPs(sessionID)
+	if err != nil {
+		return nil, status.Errorf(codes.ResourceExhausted, "tunnel allocation: %v", err)
+	}
 
 	rec := &plugin.SessionRecord{
 		ID:           sessionID,
