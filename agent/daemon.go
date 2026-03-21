@@ -59,6 +59,7 @@ type Daemon struct {
 
 type runningSession struct {
 	containerID string
+	networkID   string // per-session Docker network
 	wgKeyPair   *WGKeyPair
 	wgConfPath  string
 	relayCancel context.CancelFunc // nil if direct/holepunched
@@ -360,7 +361,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 			rs.relayCancel()
 		}
 		if rs.containerID != "" {
-			if err := d.runner.StopContainer(ctx, rs.containerID); err != nil {
+			if err := d.runner.StopContainer(ctx, rs.containerID, sess.Id); err != nil {
 				d.log.Warn("failed to stop container after startup failure", "session_id", sid, "error", err)
 			}
 		}
@@ -370,8 +371,14 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 		_ = RemoveConfig(sess.Id)
 	}
 
-	// 1. Start Docker container
-	containerID, sshPort, err := d.runner.StartContainer(ctx, sess.Id, sess.Allocated, sess.Image)
+	// 1. Start Docker container (with per-session SSH public key if available)
+	containerID, networkID, sshPort, err := d.runner.StartContainer(ctx, StartContainerOpts{
+		SessionID:    sess.Id,
+		Resources:    sess.Allocated,
+		ImageName:    sess.Image,
+		SSHPublicKey: sess.GetSshPublicKeyAuth(),
+		GPUCount:     int(sess.Allocated.GetGpuCount()),
+	})
 	if err != nil {
 		d.log.Error("container start failed", "session_id", sid, "error", err)
 		cleanupFailedStart()
@@ -379,6 +386,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 		return
 	}
 	rs.containerID = containerID
+	rs.networkID = networkID
 
 	// 2. Generate WireGuard keypair
 	kp, err := GenerateKeyPair()
@@ -587,7 +595,7 @@ func (d *Daemon) stopSession(ctx context.Context, sessionID string) {
 		rs.relayCancel()
 	}
 
-	if err := d.runner.StopContainer(ctx, rs.containerID); err != nil {
+	if err := d.runner.StopContainer(ctx, rs.containerID, sessionID); err != nil {
 		d.log.Warn("stop container failed", "session_id", sessionID[:8], "error", err)
 	}
 
