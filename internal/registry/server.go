@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -207,9 +208,66 @@ func storeErr(err error) error {
 
 // ── RPCs ───────────────────────────────────────────────────────────
 
+// providerIDFromMetadata extracts the "x-provider-id" value from incoming gRPC
+// metadata. Returns empty string if not present.
+func providerIDFromMetadata(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	vals := md.Get("x-provider-id")
+	if len(vals) == 0 {
+		return ""
+	}
+	return vals[0]
+}
+
 func (s *Server) RegisterProvider(ctx context.Context, req *computev1.RegisterProviderRequest) (*computev1.RegisterProviderResponse, error) {
-	id := uuid.NewString()
 	now := time.Now().Unix()
+
+	// Check for re-registration: if the caller supplies an existing provider ID
+	// via gRPC metadata, update the existing record instead of creating a new one.
+	if existingID := providerIDFromMetadata(ctx); existingID != "" {
+		existing, err := s.plugins.Store.GetProvider(ctx, existingID)
+		if err == nil {
+			// Provider found — update its info and reset to online.
+			existing.Name = req.Name
+			existing.Address = req.Address
+			existing.Status = "online"
+			existing.CPUCores = req.Capacity.GetCpuCores()
+			existing.MemoryMB = req.Capacity.GetMemoryMb()
+			existing.DiskGB = req.Capacity.GetDiskGb()
+			existing.GPUCount = req.Capacity.GetGpuCount()
+			existing.GPUModel = req.Capacity.GetGpuModel()
+			existing.AvailCPU = req.Capacity.GetCpuCores()
+			existing.AvailMemoryMB = req.Capacity.GetMemoryMb()
+			existing.AvailGPU = req.Capacity.GetGpuCount()
+			existing.LastHeartbeat = now
+
+			if err := s.plugins.Store.PutProvider(ctx, existing); err != nil {
+				return nil, storeErr(err)
+			}
+
+			// Notify plugin hook (e.g. to refresh provider-user link).
+			if hook, ok := s.plugins.Auth.(plugin.RegistrationHook); ok {
+				if err := hook.OnProviderRegistered(ctx, existingID); err != nil {
+					return nil, status.Errorf(codes.Internal, "registration hook: %v", err)
+				}
+			}
+
+			return &computev1.RegisterProviderResponse{
+				Provider: providerToProto(existing),
+				Token:    "tok_" + existingID,
+			}, nil
+		}
+		// If provider not found, fall through to create a new one.
+		if !errors.Is(err, plugin.ErrNotFound) {
+			return nil, storeErr(err)
+		}
+	}
+
+	// New registration (current behavior).
+	id := uuid.NewString()
 
 	rec := &plugin.ProviderRecord{
 		ID:            id,

@@ -9,6 +9,7 @@ import (
 	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
 	"github.com/OpenStruct/peer_compute/plugin"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -571,5 +572,156 @@ func TestCreateSession_ProviderOffline(t *testing.T) {
 	}
 	if st.Code() != codes.Unavailable {
 		t.Errorf("code = %v, want Unavailable", st.Code())
+	}
+}
+
+// --- Re-registration tests ---
+
+// withProviderID returns a context with x-provider-id set in incoming gRPC metadata.
+func withProviderID(ctx context.Context, id string) context.Context {
+	md := metadata.Pairs("x-provider-id", id)
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+func TestReRegisterProvider_ExistingID(t *testing.T) {
+	s := newTestServer()
+	ctx := context.Background()
+
+	// First registration: create a new provider.
+	resp1, err := s.RegisterProvider(ctx, &computev1.RegisterProviderRequest{
+		Name:    "original",
+		Address: "1.1.1.1:5000",
+		Capacity: &computev1.Resources{
+			CpuCores: 4,
+			MemoryMb: 8192,
+		},
+	})
+	if err != nil {
+		t.Fatalf("first RegisterProvider: %v", err)
+	}
+	originalID := resp1.Provider.Id
+
+	// Set provider offline to simulate a restart.
+	prov, _ := s.plugins.Store.GetProvider(ctx, originalID)
+	prov.Status = "offline"
+	s.plugins.Store.PutProvider(ctx, prov)
+
+	// Re-register with the same ID via metadata.
+	reregCtx := withProviderID(ctx, originalID)
+	resp2, err := s.RegisterProvider(reregCtx, &computev1.RegisterProviderRequest{
+		Name:    "updated-name",
+		Address: "2.2.2.2:6000",
+		Capacity: &computev1.Resources{
+			CpuCores: 8,
+			MemoryMb: 16384,
+		},
+	})
+	if err != nil {
+		t.Fatalf("re-RegisterProvider: %v", err)
+	}
+
+	// Should reuse the same provider ID.
+	if resp2.Provider.Id != originalID {
+		t.Errorf("re-registration returned new ID %q, want %q", resp2.Provider.Id, originalID)
+	}
+
+	// Verify the provider record was updated.
+	if resp2.Provider.Name != "updated-name" {
+		t.Errorf("Name = %q, want %q", resp2.Provider.Name, "updated-name")
+	}
+	if resp2.Provider.Address != "2.2.2.2:6000" {
+		t.Errorf("Address = %q, want %q", resp2.Provider.Address, "2.2.2.2:6000")
+	}
+	if resp2.Provider.Status != "online" {
+		t.Errorf("Status = %q, want %q", resp2.Provider.Status, "online")
+	}
+	if resp2.Provider.Capacity.CpuCores != 8 {
+		t.Errorf("CpuCores = %d, want 8", resp2.Provider.Capacity.CpuCores)
+	}
+	if resp2.Provider.Capacity.MemoryMb != 16384 {
+		t.Errorf("MemoryMb = %d, want 16384", resp2.Provider.Capacity.MemoryMb)
+	}
+}
+
+func TestReRegisterProvider_UnknownIDFallsBack(t *testing.T) {
+	s := newTestServer()
+	ctx := context.Background()
+
+	// Re-register with a non-existent ID should create a new provider.
+	reregCtx := withProviderID(ctx, "nonexistent-id")
+	resp, err := s.RegisterProvider(reregCtx, &computev1.RegisterProviderRequest{
+		Name:    "fallback",
+		Address: "3.3.3.3:7000",
+		Capacity: &computev1.Resources{
+			CpuCores: 2,
+			MemoryMb: 4096,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterProvider with unknown ID: %v", err)
+	}
+
+	// Should get a new ID, not the nonexistent one.
+	if resp.Provider.Id == "nonexistent-id" {
+		t.Error("should not reuse a nonexistent ID")
+	}
+	if resp.Provider.Id == "" {
+		t.Error("Provider.Id should not be empty")
+	}
+	if resp.Provider.Name != "fallback" {
+		t.Errorf("Name = %q, want %q", resp.Provider.Name, "fallback")
+	}
+}
+
+func TestReRegisterProvider_NoMetadata(t *testing.T) {
+	s := newTestServer()
+	ctx := context.Background()
+
+	// Without metadata, should create new (current behavior).
+	resp, err := s.RegisterProvider(ctx, &computev1.RegisterProviderRequest{
+		Name:    "no-metadata",
+		Address: "4.4.4.4:8000",
+		Capacity: &computev1.Resources{
+			CpuCores: 1,
+			MemoryMb: 2048,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+	if resp.Provider.Id == "" {
+		t.Error("expected a new provider ID")
+	}
+}
+
+func TestProviderIDFromMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  context.Context
+		want string
+	}{
+		{
+			name: "with metadata",
+			ctx:  withProviderID(context.Background(), "test-id"),
+			want: "test-id",
+		},
+		{
+			name: "without metadata",
+			ctx:  context.Background(),
+			want: "",
+		},
+		{
+			name: "empty metadata",
+			ctx:  metadata.NewIncomingContext(context.Background(), metadata.MD{}),
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := providerIDFromMetadata(tt.ctx)
+			if got != tt.want {
+				t.Errorf("providerIDFromMetadata() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

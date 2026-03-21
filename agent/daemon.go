@@ -2,16 +2,20 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
 	"github.com/OpenStruct/peer_compute/internal/logging"
@@ -36,6 +40,7 @@ type Config struct {
 	WGListenPort      int    // base port for WireGuard tunnels
 	STUNAddr          string // registry STUN endpoint (e.g. registry:3478)
 	RelayAddr         string // registry relay endpoint (e.g. registry:3479)
+	StateDir          string // directory for persisting provider identity (default: ~/.peercompute/)
 }
 
 type Daemon struct {
@@ -60,12 +65,65 @@ type runningSession struct {
 	connMode    string             // "direct", "holepunch", "relay"
 }
 
+// providerState is the on-disk representation of a provider's identity,
+// written to StateDir/provider.json after successful registration.
+type providerState struct {
+	ProviderID string `json:"provider_id"`
+	Token      string `json:"token"`
+}
+
+// defaultStateDir returns the default state directory (~/.peercompute/).
+func defaultStateDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), ".peercompute")
+	}
+	return filepath.Join(home, ".peercompute")
+}
+
+// loadProviderState reads the persisted provider identity from disk.
+// Returns nil (no error) if the file does not exist.
+func loadProviderState(stateDir string) (*providerState, error) {
+	path := filepath.Join(stateDir, "provider.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read provider state: %w", err)
+	}
+	var state providerState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("parse provider state: %w", err)
+	}
+	if state.ProviderID == "" {
+		return nil, nil
+	}
+	return &state, nil
+}
+
+// saveProviderState writes the provider identity to disk.
+func saveProviderState(stateDir string, state *providerState) error {
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal provider state: %w", err)
+	}
+	path := filepath.Join(stateDir, "provider.json")
+	return os.WriteFile(path, data, 0600)
+}
+
 func NewDaemon(cfg Config) (*Daemon, error) {
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 5 * time.Second
 	}
 	if cfg.WGListenPort == 0 {
 		cfg.WGListenPort = 51820
+	}
+	if cfg.StateDir == "" {
+		cfg.StateDir = defaultStateDir()
 	}
 
 	log := logging.New("agent")
@@ -124,7 +182,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 func (d *Daemon) register(ctx context.Context) error {
-	resp, err := d.client.RegisterProvider(ctx, &computev1.RegisterProviderRequest{
+	// Try to load a previously persisted provider ID for stable identity.
+	var previousID string
+	state, err := loadProviderState(d.cfg.StateDir)
+	if err != nil {
+		d.log.Warn("failed to load provider state, will create new identity", "error", err)
+	} else if state != nil {
+		previousID = state.ProviderID
+		d.log.Info("found persisted provider identity", "provider_id", previousID)
+	}
+
+	// If we have a previous ID, pass it as gRPC metadata so the registry can
+	// re-register us under the same identity.
+	regCtx := ctx
+	if previousID != "" {
+		md := metadata.Pairs("x-provider-id", previousID)
+		regCtx = metadata.NewOutgoingContext(ctx, md)
+	}
+
+	resp, err := d.client.RegisterProvider(regCtx, &computev1.RegisterProviderRequest{
 		Name:    d.cfg.Name,
 		Address: d.cfg.Address,
 		Capacity: &computev1.Resources{
@@ -141,6 +217,15 @@ func (d *Daemon) register(ctx context.Context) error {
 
 	d.provider = resp.Provider
 	d.token = resp.Token
+
+	// Persist the provider identity for future restarts.
+	if err := saveProviderState(d.cfg.StateDir, &providerState{
+		ProviderID: resp.Provider.Id,
+		Token:      resp.Token,
+	}); err != nil {
+		d.log.Warn("failed to persist provider state", "error", err)
+	}
+
 	return nil
 }
 
