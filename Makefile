@@ -17,6 +17,7 @@ build: proto
 	go build -o bin/registry ./cmd/registry
 	go build -o bin/agent ./cmd/agent
 	go build -o bin/peerctl ./cmd/peerctl
+	go build -o bin/relay ./cmd/relay
 
 agent-cross:
 	GOOS=darwin GOARCH=arm64 go build -o bin/pcp-agent-darwin-arm64 ./cmd/agent

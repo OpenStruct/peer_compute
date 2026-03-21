@@ -3,8 +3,10 @@ package relay
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -82,6 +84,25 @@ func (rs *RelayServer) RemoveSession(token string) {
 	rs.mu.Lock()
 	delete(rs.sessions, token)
 	rs.mu.Unlock()
+}
+
+// SessionCount returns the current number of active relay sessions.
+func (rs *RelayServer) SessionCount() int {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return len(rs.sessions)
+}
+
+// ServeHealthz starts an HTTP health check endpoint on the given port.
+// The /healthz endpoint returns the current session count as JSON.
+func (rs *RelayServer) ServeHealthz(port int) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"ok","sessions":%d}`, rs.SessionCount())
+	})
+	return http.ListenAndServe(fmt.Sprintf(":%d", port), mux)
 }
 
 // Run starts the relay UDP listener. Blocks until ctx is cancelled.

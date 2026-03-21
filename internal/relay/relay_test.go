@@ -3,9 +3,11 @@ package relay
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -158,6 +160,85 @@ func TestRelayServer_PacketProtocol(t *testing.T) {
 		t.Fatal("peerA not registered after first packet")
 	}
 	rs.mu.RUnlock()
+}
+
+func TestRelayServer_SessionCount(t *testing.T) {
+	rs := NewRelayServer(":0", discardLogger())
+
+	if got := rs.SessionCount(); got != 0 {
+		t.Errorf("SessionCount() = %d, want 0", got)
+	}
+
+	rs.RegisterSession("token-1", "session-11111111")
+	if got := rs.SessionCount(); got != 1 {
+		t.Errorf("SessionCount() = %d, want 1", got)
+	}
+
+	rs.RegisterSession("token-2", "session-22222222")
+	if got := rs.SessionCount(); got != 2 {
+		t.Errorf("SessionCount() = %d, want 2", got)
+	}
+
+	rs.RemoveSession("token-1")
+	if got := rs.SessionCount(); got != 1 {
+		t.Errorf("SessionCount() = %d, want 1", got)
+	}
+}
+
+func TestRelayServer_ServeHealthz(t *testing.T) {
+	rs := NewRelayServer(":0", discardLogger())
+	rs.RegisterSession("health-token", "session-health01")
+
+	// Start healthz on a random port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	go rs.ServeHealthz(port)
+	// Give the HTTP server time to start.
+	time.Sleep(50 * time.Millisecond)
+
+	resp, err := http.Get("http://127.0.0.1:" + itoa(port) + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var body struct {
+		Status   string `json:"status"`
+		Sessions int    `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Status != "ok" {
+		t.Errorf("status = %q, want %q", body.Status, "ok")
+	}
+	if body.Sessions != 1 {
+		t.Errorf("sessions = %d, want 1", body.Sessions)
+	}
+}
+
+// itoa converts an int to a string without importing strconv.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
 }
 
 func TestRelayServer_IdleTimeout(t *testing.T) {
