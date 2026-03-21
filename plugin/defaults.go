@@ -125,6 +125,18 @@ func (m *MemoryStore) ListProviders(_ context.Context, filter ProviderFilter) ([
 	return out, nil
 }
 
+func (m *MemoryStore) UpdateHeartbeat(_ context.Context, providerID string, heartbeat int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.providers[providerID]
+	if !ok {
+		return ErrNotFound
+	}
+	p.LastHeartbeat = heartbeat
+	p.Status = "online"
+	return nil
+}
+
 func (m *MemoryStore) DeleteProvider(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -194,6 +206,22 @@ func (m *MemoryStore) DeleteSession(_ context.Context, id string) error {
 	defer m.mu.Unlock()
 	delete(m.sessions, id)
 	return nil
+}
+
+func (m *MemoryStore) GetTerminatedSessionIDs(_ context.Context, sessionIDs []string, providerID string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var terminated []string
+	for _, sid := range sessionIDs {
+		s, ok := m.sessions[sid]
+		if !ok {
+			continue
+		}
+		if s.ProviderID == providerID && s.Status == "terminated" {
+			terminated = append(terminated, s.ID)
+		}
+	}
+	return terminated, nil
 }
 
 // ── Bundle ─────────────────────────────────────────────────────────

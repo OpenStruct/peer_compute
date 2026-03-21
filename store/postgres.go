@@ -7,9 +7,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"strconv"
+	"time"
 
 	sq "github.com/Masterminds/squirrel"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 
 	"github.com/OpenStruct/peer_compute/plugin"
 )
@@ -31,9 +34,37 @@ func New(dsn string) (*PostgresStore, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
+	db.SetMaxOpenConns(envInt("DB_MAX_OPEN_CONNS", 50))
+	db.SetMaxIdleConns(envInt("DB_MAX_IDLE_CONNS", 25))
+	db.SetConnMaxLifetime(envDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute))
+	db.SetConnMaxIdleTime(envDuration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute))
 	return &PostgresStore{db: db}, nil
+}
+
+// envInt reads an integer from the environment, returning def if unset or invalid.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// envDuration reads a duration (in seconds) from the environment, returning def if unset.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return time.Duration(n) * time.Second
 }
 
 // NewFromDB wraps an existing *sql.DB. Intended for testing with sqlmock.
@@ -66,6 +97,16 @@ func (s *PostgresStore) PutProvider(ctx context.Context, p *plugin.ProviderRecor
 		p.CPUCores, p.MemoryMB, p.DiskGB, p.GPUCount, p.GPUModel,
 		p.AvailCPU, p.AvailMemoryMB, p.AvailGPU,
 		p.RegisteredAt, p.LastHeartbeat)
+	return err
+}
+
+// UpdateHeartbeat performs a lightweight heartbeat update, setting only
+// the last_heartbeat timestamp and status to 'online'. This avoids the
+// overhead of the full UPSERT that PutProvider performs.
+func (s *PostgresStore) UpdateHeartbeat(ctx context.Context, providerID string, heartbeat int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE providers SET last_heartbeat = $1, status = 'online' WHERE id = $2`,
+		heartbeat, providerID)
 	return err
 }
 
@@ -264,6 +305,29 @@ func (s *PostgresStore) ListSessions(ctx context.Context, filter plugin.SessionF
 func (s *PostgresStore) DeleteSession(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id = $1`, id)
 	return err
+}
+
+func (s *PostgresStore) GetTerminatedSessionIDs(ctx context.Context, sessionIDs []string, providerID string) ([]string, error) {
+	if len(sessionIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM sessions WHERE id = ANY($1) AND provider_id = $2 AND status = 'terminated'`,
+		pq.Array(sessionIDs), providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var terminated []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		terminated = append(terminated, id)
+	}
+	return terminated, rows.Err()
 }
 
 // ── Scan helpers ───────────────────────────────────────────────────

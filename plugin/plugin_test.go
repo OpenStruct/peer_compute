@@ -323,6 +323,43 @@ func TestMemoryStore_DeleteSession(t *testing.T) {
 	}
 }
 
+// --- MemoryStore GetTerminatedSessionIDs tests ---
+
+func TestMemoryStore_GetTerminatedSessionIDs(t *testing.T) {
+	s := NewMemoryStore()
+	ctx := context.Background()
+	_ = s.PutSession(ctx, &SessionRecord{ID: "s1", ProviderID: "p1", Status: "terminated"})
+	_ = s.PutSession(ctx, &SessionRecord{ID: "s2", ProviderID: "p1", Status: "running"})
+	_ = s.PutSession(ctx, &SessionRecord{ID: "s3", ProviderID: "p2", Status: "terminated"})
+	_ = s.PutSession(ctx, &SessionRecord{ID: "s4", ProviderID: "p1", Status: "terminated"})
+
+	tests := []struct {
+		name       string
+		sessionIDs []string
+		providerID string
+		want       int
+	}{
+		{"matches terminated for provider", []string{"s1", "s2", "s3", "s4"}, "p1", 2},
+		{"wrong provider returns none", []string{"s1", "s2"}, "p2", 0},
+		{"only terminated for p2", []string{"s3"}, "p2", 1},
+		{"non-existent sessions", []string{"s99"}, "p1", 0},
+		{"empty input", []string{}, "p1", 0},
+		{"nil input", nil, "p1", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := s.GetTerminatedSessionIDs(ctx, tt.sessionIDs, tt.providerID)
+			if err != nil {
+				t.Fatalf("GetTerminatedSessionIDs: %v", err)
+			}
+			if len(got) != tt.want {
+				t.Errorf("len = %d, want %d (got %v)", len(got), tt.want, got)
+			}
+		})
+	}
+}
+
 // --- Defaults test ---
 
 func TestDefaults(t *testing.T) {

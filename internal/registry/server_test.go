@@ -396,6 +396,79 @@ func TestHeartbeat(t *testing.T) {
 	}
 }
 
+func TestHeartbeat_BatchTermination(t *testing.T) {
+	s := newTestServer()
+	ctx := context.Background()
+
+	reg, err := s.RegisterProvider(ctx, &computev1.RegisterProviderRequest{
+		Name:    "batch-hb-test",
+		Address: "1.2.3.4:5000",
+		Capacity: &computev1.Resources{
+			CpuCores: 8,
+			MemoryMb: 16384,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+	providerID := reg.Provider.Id
+
+	// Create 3 sessions: terminate 2, leave 1 running.
+	var sessionIDs []string
+	var terminatedIDs []string
+	for i := 0; i < 3; i++ {
+		created, err := s.CreateSession(ctx, &computev1.CreateSessionRequest{
+			ProviderId: providerID,
+			RenterId:   fmt.Sprintf("renter-%d", i),
+			Image:      "ubuntu:22.04",
+			Requested: &computev1.Resources{
+				CpuCores: 1,
+				MemoryMb: 1024,
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateSession %d: %v", i, err)
+		}
+		sessionIDs = append(sessionIDs, created.Session.Id)
+
+		if i < 2 { // terminate first two
+			_, err = s.TerminateSession(ctx, &computev1.TerminateSessionRequest{
+				SessionId: created.Session.Id,
+			})
+			if err != nil {
+				t.Fatalf("TerminateSession %d: %v", i, err)
+			}
+			terminatedIDs = append(terminatedIDs, created.Session.Id)
+		}
+	}
+
+	// Send heartbeat with all 3 sessions as active — should get back 2 terminated.
+	resp, err := s.Heartbeat(ctx, &computev1.HeartbeatRequest{
+		ProviderId:     providerID,
+		ActiveSessions: sessionIDs,
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if !resp.Acknowledged {
+		t.Error("Heartbeat not acknowledged")
+	}
+	if len(resp.TerminateSessions) != 2 {
+		t.Fatalf("terminate sessions len = %d, want 2; got %v", len(resp.TerminateSessions), resp.TerminateSessions)
+	}
+
+	// Verify the terminated session IDs match (order may vary).
+	terminatedSet := make(map[string]bool)
+	for _, id := range resp.TerminateSessions {
+		terminatedSet[id] = true
+	}
+	for _, id := range terminatedIDs {
+		if !terminatedSet[id] {
+			t.Errorf("expected %q in terminate list", id)
+		}
+	}
+}
+
 func TestListProviders(t *testing.T) {
 	s := newTestServer()
 	ctx := context.Background()

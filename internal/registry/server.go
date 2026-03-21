@@ -309,28 +309,32 @@ func (s *Server) Heartbeat(ctx context.Context, req *computev1.HeartbeatRequest)
 		return nil, storeErr(err)
 	}
 
-	rec.LastHeartbeat = time.Now().Unix()
-	rec.Status = "online"
+	now := time.Now().Unix()
+
 	if req.Available != nil {
+		// Resource availability changed — do a full update.
+		rec.LastHeartbeat = now
+		rec.Status = "online"
 		rec.AvailCPU = req.Available.CpuCores
 		rec.AvailMemoryMB = req.Available.MemoryMb
 		rec.AvailGPU = req.Available.GpuCount
+		if err := s.plugins.Store.PutProvider(ctx, rec); err != nil {
+			return nil, storeErr(err)
+		}
+	} else {
+		// No resource changes — lightweight heartbeat UPDATE only.
+		if err := s.plugins.Store.UpdateHeartbeat(ctx, rec.ID, now); err != nil {
+			return nil, storeErr(err)
+		}
 	}
 
-	if err := s.plugins.Store.PutProvider(ctx, rec); err != nil {
-		return nil, storeErr(err)
-	}
 	resp := &computev1.HeartbeatResponse{Acknowledged: true}
-	for _, sid := range req.ActiveSessions {
-		sess, err := s.plugins.Store.GetSessionByPrefix(ctx, sid)
-		if err != nil {
-			continue
-		}
-		if sess.ProviderID != rec.ID {
-			continue
-		}
-		if sess.Status == "terminated" {
-			resp.TerminateSessions = append(resp.TerminateSessions, sess.ID)
+
+	// Batch-check terminated sessions in a single query instead of N individual lookups.
+	if len(req.ActiveSessions) > 0 {
+		terminated, err := s.plugins.Store.GetTerminatedSessionIDs(ctx, req.ActiveSessions, rec.ID)
+		if err == nil {
+			resp.TerminateSessions = terminated
 		}
 	}
 

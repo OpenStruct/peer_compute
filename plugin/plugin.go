@@ -51,6 +51,8 @@ type ProviderStore interface {
 	GetProviderByPrefix(ctx context.Context, prefix string) (*ProviderRecord, error)
 	ListProviders(ctx context.Context, filter ProviderFilter) ([]*ProviderRecord, error)
 	DeleteProvider(ctx context.Context, id string) error
+	// UpdateHeartbeat performs a lightweight heartbeat-only update (timestamp + online status).
+	UpdateHeartbeat(ctx context.Context, providerID string, heartbeat int64) error
 }
 
 // SessionStore manages session records.
@@ -60,6 +62,11 @@ type SessionStore interface {
 	GetSessionByPrefix(ctx context.Context, prefix string) (*SessionRecord, error)
 	ListSessions(ctx context.Context, filter SessionFilter) ([]*SessionRecord, error)
 	DeleteSession(ctx context.Context, id string) error
+
+	// GetTerminatedSessionIDs returns the subset of sessionIDs that are terminated
+	// and belong to the given provider. Used by the Heartbeat handler to batch-check
+	// session status instead of N individual lookups.
+	GetTerminatedSessionIDs(ctx context.Context, sessionIDs []string, providerID string) ([]string, error)
 }
 
 // ProviderRecord is the storage-layer representation of a provider.
