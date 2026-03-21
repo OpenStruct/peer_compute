@@ -208,25 +208,26 @@ func (x *Provider) GetPublicAddress() string {
 }
 
 type Session struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Id             string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	ProviderId     string                 `protobuf:"bytes,2,opt,name=provider_id,json=providerId,proto3" json:"provider_id,omitempty"`
-	RenterId       string                 `protobuf:"bytes,3,opt,name=renter_id,json=renterId,proto3" json:"renter_id,omitempty"`
-	Allocated      *Resources             `protobuf:"bytes,4,opt,name=allocated,proto3" json:"allocated,omitempty"`
-	Status         string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"` // "pending", "running", "terminated"
-	ContainerId    string                 `protobuf:"bytes,6,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
-	SshEndpoint    string                 `protobuf:"bytes,7,opt,name=ssh_endpoint,json=sshEndpoint,proto3" json:"ssh_endpoint,omitempty"`
-	Image          string                 `protobuf:"bytes,8,opt,name=image,proto3" json:"image,omitempty"`
-	CreatedAt      *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	TerminatedAt   *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=terminated_at,json=terminatedAt,proto3" json:"terminated_at,omitempty"`
-	WgPublicKey    string                 `protobuf:"bytes,11,opt,name=wg_public_key,json=wgPublicKey,proto3" json:"wg_public_key,omitempty"`        // provider-side WireGuard public key
-	WgEndpoint     string                 `protobuf:"bytes,12,opt,name=wg_endpoint,json=wgEndpoint,proto3" json:"wg_endpoint,omitempty"`             // provider's WireGuard endpoint
-	ConnectionMode string                 `protobuf:"bytes,13,opt,name=connection_mode,json=connectionMode,proto3" json:"connection_mode,omitempty"` // "direct", "holepunch", "relay"
-	RelayToken     string                 `protobuf:"bytes,14,opt,name=relay_token,json=relayToken,proto3" json:"relay_token,omitempty"`             // token for relay authentication
-	WgProviderIp   string                 `protobuf:"bytes,15,opt,name=wg_provider_ip,json=wgProviderIp,proto3" json:"wg_provider_ip,omitempty"`     // per-session tunnel IP for provider (e.g. "10.99.1.1")
-	WgRenterIp     string                 `protobuf:"bytes,16,opt,name=wg_renter_ip,json=wgRenterIp,proto3" json:"wg_renter_ip,omitempty"`           // per-session tunnel IP for renter (e.g. "10.99.1.2")
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Id               string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	ProviderId       string                 `protobuf:"bytes,2,opt,name=provider_id,json=providerId,proto3" json:"provider_id,omitempty"`
+	RenterId         string                 `protobuf:"bytes,3,opt,name=renter_id,json=renterId,proto3" json:"renter_id,omitempty"`
+	Allocated        *Resources             `protobuf:"bytes,4,opt,name=allocated,proto3" json:"allocated,omitempty"`
+	Status           string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"` // "pending", "running", "terminated"
+	ContainerId      string                 `protobuf:"bytes,6,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	SshEndpoint      string                 `protobuf:"bytes,7,opt,name=ssh_endpoint,json=sshEndpoint,proto3" json:"ssh_endpoint,omitempty"`
+	Image            string                 `protobuf:"bytes,8,opt,name=image,proto3" json:"image,omitempty"`
+	CreatedAt        *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	TerminatedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=terminated_at,json=terminatedAt,proto3" json:"terminated_at,omitempty"`
+	WgPublicKey      string                 `protobuf:"bytes,11,opt,name=wg_public_key,json=wgPublicKey,proto3" json:"wg_public_key,omitempty"`                  // provider-side WireGuard public key
+	WgEndpoint       string                 `protobuf:"bytes,12,opt,name=wg_endpoint,json=wgEndpoint,proto3" json:"wg_endpoint,omitempty"`                       // provider's WireGuard endpoint
+	ConnectionMode   string                 `protobuf:"bytes,13,opt,name=connection_mode,json=connectionMode,proto3" json:"connection_mode,omitempty"`           // "direct", "holepunch", "relay"
+	RelayToken       string                 `protobuf:"bytes,14,opt,name=relay_token,json=relayToken,proto3" json:"relay_token,omitempty"`                       // token for relay authentication
+	WgProviderIp     string                 `protobuf:"bytes,15,opt,name=wg_provider_ip,json=wgProviderIp,proto3" json:"wg_provider_ip,omitempty"`               // per-session tunnel IP for provider (e.g. "10.99.1.1")
+	WgRenterIp       string                 `protobuf:"bytes,16,opt,name=wg_renter_ip,json=wgRenterIp,proto3" json:"wg_renter_ip,omitempty"`                     // per-session tunnel IP for renter (e.g. "10.99.1.2")
+	SshPublicKeyAuth string                 `protobuf:"bytes,17,opt,name=ssh_public_key_auth,json=sshPublicKeyAuth,proto3" json:"ssh_public_key_auth,omitempty"` // per-session SSH public key (authorized_keys format)
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Session) Reset() {
@@ -367,6 +368,13 @@ func (x *Session) GetWgProviderIp() string {
 func (x *Session) GetWgRenterIp() string {
 	if x != nil {
 		return x.WgRenterIp
+	}
+	return ""
+}
+
+func (x *Session) GetSshPublicKeyAuth() string {
+	if x != nil {
+		return x.SshPublicKeyAuth
 	}
 	return ""
 }
@@ -1548,7 +1556,7 @@ const file_compute_v1_compute_proto_rawDesc = "" +
 	"\x06status\x18\x06 \x01(\tR\x06status\x12A\n" +
 	"\x0elast_heartbeat\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\rlastHeartbeat\x12?\n" +
 	"\rregistered_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\fregisteredAt\x12%\n" +
-	"\x0epublic_address\x18\t \x01(\tR\rpublicAddress\"\xd3\x04\n" +
+	"\x0epublic_address\x18\t \x01(\tR\rpublicAddress\"\x82\x05\n" +
 	"\aSession\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
@@ -1571,7 +1579,8 @@ const file_compute_v1_compute_proto_rawDesc = "" +
 	"relayToken\x12$\n" +
 	"\x0ewg_provider_ip\x18\x0f \x01(\tR\fwgProviderIp\x12 \n" +
 	"\fwg_renter_ip\x18\x10 \x01(\tR\n" +
-	"wgRenterIp\"]\n" +
+	"wgRenterIp\x12-\n" +
+	"\x13ssh_public_key_auth\x18\x11 \x01(\tR\x10sshPublicKeyAuth\"]\n" +
 	"\x11EndpointCandidate\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x1a\n" +
