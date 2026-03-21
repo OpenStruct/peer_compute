@@ -101,9 +101,17 @@ func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string,
 
 // StopContainer stops and removes a container.
 func (cr *ContainerRunner) StopContainer(ctx context.Context, containerID string) error {
-	cr.log.Info("stopping container", "container_id", containerID[:12])
+	if containerID == "" {
+		return nil
+	}
+
+	short := containerID
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	cr.log.Info("stopping container", "container_id", short)
 	if err := cr.cli.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
-		cr.log.Warn("container stop warning", "container_id", containerID[:12], "error", err)
+		cr.log.Warn("container stop warning", "container_id", short, "error", err)
 	}
 	return cr.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 }

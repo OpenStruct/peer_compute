@@ -17,6 +17,10 @@ func WGUp(ctx context.Context, confPath string, log *slog.Logger) (string, error
 	ifaceName := ifaceFromPath(confPath)
 	log.Info("activating wireguard tunnel", "interface", ifaceName, "config", confPath)
 
+	if !IsRoot() {
+		return "", fmt.Errorf("wg-quick up requires root privileges")
+	}
+
 	cmd := exec.CommandContext(ctx, "wg-quick", "up", confPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -30,6 +34,10 @@ func WGUp(ctx context.Context, confPath string, log *slog.Logger) (string, error
 func WGDown(ctx context.Context, confPath string, log *slog.Logger) error {
 	ifaceName := ifaceFromPath(confPath)
 	log.Info("deactivating wireguard tunnel", "interface", ifaceName)
+
+	if !IsRoot() {
+		return fmt.Errorf("wg-quick down requires root privileges")
+	}
 
 	cmd := exec.CommandContext(ctx, "wg-quick", "down", confPath)
 	output, err := cmd.CombinedOutput()

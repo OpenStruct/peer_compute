@@ -212,22 +212,55 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	sid := sess.Id[:8]
 	d.log.Info("starting session", "session_id", sid, "image", sess.Image)
 
+	// Reserve session slot immediately to avoid duplicate concurrent starts while
+	// this startup path performs network and container operations.
+	d.mu.Lock()
+	if _, exists := d.sessions[sess.Id]; exists {
+		d.mu.Unlock()
+		d.log.Debug("session already tracked, skipping duplicate start", "session_id", sid)
+		return
+	}
+	rs := &runningSession{}
+	d.sessions[sess.Id] = rs
+	d.mu.Unlock()
+
+	cleanupFailedStart := func() {
+		d.mu.Lock()
+		delete(d.sessions, sess.Id)
+		d.mu.Unlock()
+		if rs.relayCancel != nil {
+			rs.relayCancel()
+		}
+		if rs.containerID != "" {
+			if err := d.runner.StopContainer(ctx, rs.containerID); err != nil {
+				d.log.Warn("failed to stop container after startup failure", "session_id", sid, "error", err)
+			}
+		}
+		if rs.wgConfPath != "" {
+			_ = WGDown(ctx, rs.wgConfPath, d.log)
+		}
+		_ = RemoveConfig(sess.Id)
+	}
+
 	// 1. Start Docker container
 	containerID, sshPort, err := d.runner.StartContainer(ctx, sess.Id, sess.Allocated, sess.Image)
 	if err != nil {
 		d.log.Error("container start failed", "session_id", sid, "error", err)
+		cleanupFailedStart()
 		d.updateStatus(ctx, sess.Id, "terminated", "", "")
 		return
 	}
+	rs.containerID = containerID
 
 	// 2. Generate WireGuard keypair
 	kp, err := GenerateKeyPair()
 	if err != nil {
 		d.log.Error("keygen failed", "session_id", sid, "error", err)
-		d.runner.StopContainer(ctx, containerID)
+		cleanupFailedStart()
 		d.updateStatus(ctx, sess.Id, "terminated", "", "")
 		return
 	}
+	rs.wgKeyPair = kp
 
 	// Derive WG port from per-session tunnel index for deterministic, collision-free allocation
 	wgPort := d.cfg.WGListenPort + parseTunnelIndex(sess.GetWgProviderIp())
@@ -262,7 +295,6 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	// 5. Attempt hole-punching if we have peer candidates
 	var peerEndpoint string
 	var connMode string
-	var relayCancel context.CancelFunc
 
 	peerWGKey := exchResp.GetPeerWgPublicKey()
 
@@ -294,7 +326,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 			d.log.Error("relay client failed", "session_id", sid, "error", err)
 		} else {
 			relayCtx, cancel := context.WithCancel(ctx)
-			relayCancel = cancel
+			rs.relayCancel = cancel
 			go rc.Run(relayCtx)
 
 			peerEndpoint = fmt.Sprintf("127.0.0.1:%d", proxyPort)
@@ -343,19 +375,16 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 
 	// 7b. Auto-activate WireGuard tunnel (daemon typically runs with root privileges)
 	if confPath != "" {
+		rs.wgConfPath = confPath
 		if _, err := WGUp(ctx, confPath, d.log); err != nil {
 			d.log.Warn("wireguard auto-activation failed", "session_id", sid, "error", err)
 		}
 	}
 
-	// 8. Track running session
+	// 8. Mark mode on tracked session
 	d.mu.Lock()
-	d.sessions[sess.Id] = &runningSession{
-		containerID: containerID,
-		wgKeyPair:   kp,
-		wgConfPath:  confPath,
-		relayCancel: relayCancel,
-		connMode:    connMode,
+	if current, ok := d.sessions[sess.Id]; ok {
+		current.connMode = connMode
 	}
 	d.mu.Unlock()
 
