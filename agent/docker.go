@@ -33,6 +33,13 @@ func (cr *ContainerRunner) Close() error {
 	return cr.cli.Close()
 }
 
+// Ping verifies that the Docker daemon is reachable. A non-nil error typically
+// means Docker Desktop is not running or the socket is inaccessible.
+func (cr *ContainerRunner) Ping(ctx context.Context) error {
+	_, err := cr.cli.Ping(ctx)
+	return err
+}
+
 // StartContainer pulls the image and runs a container with resource limits.
 // Returns the container ID and the host-mapped SSH port.
 func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string, res *computev1.Resources, imageName string) (containerID string, sshPort string, err error) {
@@ -91,6 +98,9 @@ func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string,
 		inspect, err := cr.cli.ContainerInspect(ctx, resp.ID)
 		if err != nil {
 			return resp.ID, "", fmt.Errorf("container inspect: %w", err)
+		}
+		if inspect.State != nil && !inspect.State.Running {
+			return resp.ID, "", fmt.Errorf("container exited during startup (status=%s, exit_code=%d)", inspect.State.Status, inspect.State.ExitCode)
 		}
 		bindings := inspect.NetworkSettings.Ports["22/tcp"]
 		if len(bindings) > 0 && bindings[0].HostPort != "" {

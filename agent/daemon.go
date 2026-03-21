@@ -133,6 +133,13 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		return nil, fmt.Errorf("docker: %w", err)
 	}
 
+	// Verify Docker connectivity before proceeding.
+	if err := runner.Ping(context.Background()); err != nil {
+		runner.Close()
+		return nil, fmt.Errorf("docker is not running. Start Docker Desktop and try again: %w", err)
+	}
+	log.Info("docker connectivity verified")
+
 	client := cfg.Client
 	if client == nil {
 		client = NewGRPCClient(cfg.RegistryConn)
@@ -163,7 +170,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.register(ctx); err != nil {
 		return err
 	}
-	d.log.Info("registered as provider", "name", d.provider.Name, "id", d.provider.Id)
+
+	mode := "performance"
+	if d.compat {
+		mode = "compat"
+	}
+	d.log.Info("registered as provider",
+		"provider_id", d.provider.Id,
+		"name", d.provider.Name,
+		"mode", mode,
+	)
 	if d.compat {
 		d.log.Info("running in compatibility mode", "reason", d.modeNote)
 	}
@@ -212,7 +228,16 @@ func (d *Daemon) register(ctx context.Context) error {
 		},
 	})
 	if err != nil {
-		return err
+		// Log the target for easier debugging of connectivity failures.
+		target := d.cfg.Address
+		if d.cfg.RegistryConn != nil {
+			target = d.cfg.RegistryConn.Target()
+		}
+		d.log.Error("registration failed",
+			"target", target,
+			"error", err,
+		)
+		return fmt.Errorf("registration with %s failed: %w", target, err)
 	}
 
 	d.provider = resp.Provider
