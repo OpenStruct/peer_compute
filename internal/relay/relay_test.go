@@ -241,6 +241,37 @@ func itoa(n int) string {
 	return string(buf[i:])
 }
 
+func TestRelayServer_InvalidateSession(t *testing.T) {
+	rs := NewRelayServer(":0", discardLogger())
+	rs.RegisterSession("inv-token-1", "session-inv11111")
+	rs.RegisterSession("inv-token-2", "session-inv22222")
+
+	if got := rs.SessionCount(); got != 2 {
+		t.Fatalf("expected 2 sessions, got %d", got)
+	}
+
+	// Invalidate one session.
+	rs.InvalidateSession("inv-token-1")
+
+	if got := rs.SessionCount(); got != 1 {
+		t.Errorf("expected 1 session after invalidation, got %d", got)
+	}
+
+	// Verify the remaining session is the correct one.
+	rs.mu.RLock()
+	if _, ok := rs.sessions["inv-token-2"]; !ok {
+		t.Error("expected inv-token-2 to still be present")
+	}
+	rs.mu.RUnlock()
+
+	// Invalidating a non-existent token should not panic.
+	rs.InvalidateSession("nonexistent-token")
+
+	if got := rs.SessionCount(); got != 1 {
+		t.Errorf("expected 1 session after invalidating nonexistent token, got %d", got)
+	}
+}
+
 func TestRelayServer_IdleTimeout(t *testing.T) {
 	rs := NewRelayServer(":0", discardLogger())
 	rs.RegisterSession("idle-token", "session-idle1234")

@@ -451,9 +451,10 @@ func (s *Server) TerminateSession(ctx context.Context, req *computev1.TerminateS
 
 	s.plugins.Reputation.RecordOutcome(ctx, rec.ID, true)
 
-	// Clean up relay, candidate, and tunnel index state
+	// Clean up relay, candidate, and tunnel index state.
+	// Use InvalidateSession for immediate invalidation with logging.
 	if rec.RelayToken != "" && s.relay != nil {
-		s.relay.RemoveSession(rec.RelayToken)
+		s.relay.InvalidateSession(rec.RelayToken)
 	}
 	s.mu.Lock()
 	delete(s.candidates, rec.ID)

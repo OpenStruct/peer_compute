@@ -86,6 +86,22 @@ func (rs *RelayServer) RemoveSession(token string) {
 	rs.mu.Unlock()
 }
 
+// InvalidateSession immediately terminates a relay session, refusing to
+// forward any further packets. This is called when a compute session is
+// terminated to ensure the relay stops forwarding traffic before the
+// 60-second idle reaper fires.
+func (rs *RelayServer) InvalidateSession(token string) {
+	rs.mu.Lock()
+	sess, ok := rs.sessions[token]
+	delete(rs.sessions, token)
+	rs.mu.Unlock()
+
+	if ok {
+		rs.log.Info("relay session invalidated",
+			"session_id", sess.sessionID[:min(8, len(sess.sessionID))])
+	}
+}
+
 // SessionCount returns the current number of active relay sessions.
 func (rs *RelayServer) SessionCount() int {
 	rs.mu.RLock()
