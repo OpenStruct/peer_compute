@@ -320,9 +320,15 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 		}
 
 		peerWGKey := exchResp.GetPeerWgPublicKey()
+		if peerWGKey == "" {
+			// Web renters currently don't establish WireGuard keys yet.
+			// Avoid generating invalid configs and run in compatibility mode.
+			connMode = "compat"
+			d.log.Info("peer wireguard key missing, forcing compatibility mode", "session_id", sid)
+		}
 
 		// 5. Attempt hole-punching if we have peer candidates
-		if len(exchResp.GetPeerCandidates()) > 0 {
+		if connMode == "" && len(exchResp.GetPeerCandidates()) > 0 {
 			remoteCandidates := make([]nat.Candidate, len(exchResp.PeerCandidates))
 			for i, c := range exchResp.PeerCandidates {
 				remoteCandidates[i] = nat.Candidate{
@@ -376,33 +382,35 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 		}
 
 		// 7. Write and activate WireGuard config.
-		providerIP := sess.GetWgProviderIp()
-		renterIP := sess.GetWgRenterIp()
-		if providerIP == "" {
-			providerIP = "10.99.0.1" // fallback for backward compat
-		}
-		if renterIP == "" {
-			renterIP = "10.99.0.2"
-		}
+		if connMode != "compat" {
+			providerIP := sess.GetWgProviderIp()
+			renterIP := sess.GetWgRenterIp()
+			if providerIP == "" {
+				providerIP = "10.99.0.1" // fallback for backward compat
+			}
+			if renterIP == "" {
+				renterIP = "10.99.0.2"
+			}
 
-		confPath, err := WriteConfig(sess.Id, WGConfig{
-			PrivateKey:    kp.PrivateKey,
-			TunnelIP:      providerIP,
-			ListenPort:    wgPort,
-			PeerPublicKey: peerWGKey,
-			PeerIP:        renterIP,
-			PeerEndpoint:  peerEndpoint,
-		})
-		if err != nil {
-			d.log.Error("wireguard config failed", "session_id", sid, "error", err)
-		}
+			confPath, err := WriteConfig(sess.Id, WGConfig{
+				PrivateKey:    kp.PrivateKey,
+				TunnelIP:      providerIP,
+				ListenPort:    wgPort,
+				PeerPublicKey: peerWGKey,
+				PeerIP:        renterIP,
+				PeerEndpoint:  peerEndpoint,
+			})
+			if err != nil {
+				d.log.Error("wireguard config failed", "session_id", sid, "error", err)
+			}
 
-		if confPath != "" {
-			rs.wgConfPath = confPath
-			if _, err := WGUp(ctx, confPath, d.log); err != nil {
-				d.log.Warn("wireguard auto-activation failed", "session_id", sid, "error", err)
-				// Fall back to compatibility mode if WG cannot be activated.
-				connMode = "compat"
+			if confPath != "" {
+				rs.wgConfPath = confPath
+				if _, err := WGUp(ctx, confPath, d.log); err != nil {
+					d.log.Warn("wireguard auto-activation failed", "session_id", sid, "error", err)
+					// Fall back to compatibility mode if WG cannot be activated.
+					connMode = "compat"
+				}
 			}
 		}
 	}
