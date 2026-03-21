@@ -21,10 +21,10 @@ import (
 
 type Config struct {
 	Name              string
-	Address           string         // host:port advertised to renters
-	Token             string         // API key for authenticated registration (optional)
+	Address           string           // host:port advertised to renters
+	Token             string           // API key for authenticated registration (optional)
 	RegistryConn      *grpc.ClientConn // used when Client is nil (gRPC mode)
-	Client            RegistryClient // if set, used directly (REST mode)
+	Client            RegistryClient   // if set, used directly (REST mode)
 	HeartbeatInterval time.Duration
 	PollInterval      time.Duration
 	CPUCores          uint32
@@ -44,6 +44,8 @@ type Daemon struct {
 	provider *computev1.Provider
 	token    string
 	log      *slog.Logger
+	compat   bool
+	modeNote string
 
 	mu       sync.Mutex
 	sessions map[string]*runningSession // sessionID -> running state
@@ -77,12 +79,24 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		client = NewGRPCClient(cfg.RegistryConn)
 	}
 
+	compat := false
+	modeNote := ""
+	if !HasWGQuick() {
+		compat = true
+		modeNote = "wg-quick not found"
+	} else if !IsRoot() {
+		compat = true
+		modeNote = "insufficient privileges for wg-quick"
+	}
+
 	return &Daemon{
 		cfg:      cfg,
 		client:   client,
 		runner:   runner,
 		sessions: make(map[string]*runningSession),
 		log:      log,
+		compat:   compat,
+		modeNote: modeNote,
 	}, nil
 }
 
@@ -91,6 +105,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	d.log.Info("registered as provider", "name", d.provider.Name, "id", d.provider.Id)
+	if d.compat {
+		d.log.Info("running in compatibility mode", "reason", d.modeNote)
+	}
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- d.heartbeatLoop(ctx) }()
@@ -247,7 +264,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	if err != nil {
 		d.log.Error("container start failed", "session_id", sid, "error", err)
 		cleanupFailedStart()
-		d.updateStatus(ctx, sess.Id, "terminated", "", "")
+		d.updateStatus(ctx, sess.Id, "terminated", "", "", "")
 		return
 	}
 	rs.containerID = containerID
@@ -257,7 +274,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	if err != nil {
 		d.log.Error("keygen failed", "session_id", sid, "error", err)
 		cleanupFailedStart()
-		d.updateStatus(ctx, sess.Id, "terminated", "", "")
+		d.updateStatus(ctx, sess.Id, "terminated", "", "", "")
 		return
 	}
 	rs.wgKeyPair = kp
@@ -265,119 +282,127 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	// Derive WG port from per-session tunnel index for deterministic, collision-free allocation
 	wgPort := d.cfg.WGListenPort + parseTunnelIndex(sess.GetWgProviderIp())
 
-	// 3. Gather endpoint candidates (local + STUN)
-	candidates, err := nat.GatherCandidates(ctx, d.cfg.STUNAddr, wgPort, d.log)
-	if err != nil {
-		d.log.Warn("candidate gathering failed", "session_id", sid, "error", err)
-	}
-
-	// Convert to proto candidates
-	protoCandidates := make([]*computev1.EndpointCandidate, len(candidates))
-	for i, c := range candidates {
-		protoCandidates[i] = &computev1.EndpointCandidate{
-			Address:  c.Address,
-			Type:     c.Type,
-			Priority: c.Priority,
-		}
-	}
-
-	// 4. Exchange candidates with the renter via registry
-	exchResp, err := d.client.ExchangeCandidates(ctx, &computev1.ExchangeCandidatesRequest{
-		SessionId:   sess.Id,
-		PeerId:      d.provider.Id,
-		Candidates:  protoCandidates,
-		WgPublicKey: kp.PublicKey,
-	})
-	if err != nil {
-		d.log.Warn("candidate exchange failed", "session_id", sid, "error", err)
-	}
-
-	// 5. Attempt hole-punching if we have peer candidates
+	// 3-6. Connectivity mode negotiation.
+	var exchResp *computev1.ExchangeCandidatesResponse
 	var peerEndpoint string
 	var connMode string
 
-	peerWGKey := exchResp.GetPeerWgPublicKey()
+	if d.compat {
+		connMode = "compat"
+	} else {
+		// 3. Gather endpoint candidates (local + STUN)
+		candidates, err := nat.GatherCandidates(ctx, d.cfg.STUNAddr, wgPort, d.log)
+		if err != nil {
+			d.log.Warn("candidate gathering failed", "session_id", sid, "error", err)
+		}
 
-	if len(exchResp.GetPeerCandidates()) > 0 {
-		remoteCandidates := make([]nat.Candidate, len(exchResp.PeerCandidates))
-		for i, c := range exchResp.PeerCandidates {
-			remoteCandidates[i] = nat.Candidate{
+		// Convert to proto candidates
+		protoCandidates := make([]*computev1.EndpointCandidate, len(candidates))
+		for i, c := range candidates {
+			protoCandidates[i] = &computev1.EndpointCandidate{
 				Address:  c.Address,
 				Type:     c.Type,
 				Priority: c.Priority,
 			}
 		}
 
-		addr, err := nat.Probe(ctx, wgPort, remoteCandidates, 10*time.Second, d.log)
-		if err == nil {
-			peerEndpoint = addr
-			connMode = "holepunch"
-			d.log.Info("hole punch succeeded", "session_id", sid, "endpoint", addr)
-		} else if errors.Is(err, nat.ErrHolePunchFailed) {
-			d.log.Info("hole punch failed, falling back to relay", "session_id", sid)
-		}
-	}
-
-	// 6. Relay fallback
-	if connMode == "" && exchResp.GetRelayAddress() != "" {
-		proxyPort := wgPort + 10000 // offset to avoid collision
-		rc, err := relay.NewRelayClient(exchResp.RelayAddress, exchResp.RelayToken, proxyPort, wgPort, d.log)
+		// 4. Exchange candidates with the renter via registry
+		exchResp, err = d.client.ExchangeCandidates(ctx, &computev1.ExchangeCandidatesRequest{
+			SessionId:   sess.Id,
+			PeerId:      d.provider.Id,
+			Candidates:  protoCandidates,
+			WgPublicKey: kp.PublicKey,
+		})
 		if err != nil {
-			d.log.Error("relay client failed", "session_id", sid, "error", err)
-		} else {
-			relayCtx, cancel := context.WithCancel(ctx)
-			rs.relayCancel = cancel
-			go rc.Run(relayCtx)
-
-			peerEndpoint = fmt.Sprintf("127.0.0.1:%d", proxyPort)
-			connMode = "relay"
-
-			// Tell registry to activate relay
-			retry.Do(ctx, retry.DefaultConfig(), func(ctx context.Context) error {
-				_, err := d.client.ReportConnectionResult(ctx, &computev1.ReportConnectionResultRequest{
-					SessionId: sess.Id,
-					PeerId:    d.provider.Id,
-					UseRelay:  true,
-				})
-				return err
-			})
-
-			d.log.Info("relay active", "session_id", sid, "relay_addr", exchResp.RelayAddress)
+			d.log.Warn("candidate exchange failed", "session_id", sid, "error", err)
+			exchResp = &computev1.ExchangeCandidatesResponse{}
 		}
-	}
 
-	if connMode == "" {
-		connMode = "direct"
-		peerEndpoint = ""
-	}
+		peerWGKey := exchResp.GetPeerWgPublicKey()
 
-	// 7. Write WireGuard config using per-session tunnel IPs
-	providerIP := sess.GetWgProviderIp()
-	renterIP := sess.GetWgRenterIp()
-	if providerIP == "" {
-		providerIP = "10.99.0.1" // fallback for backward compat
-	}
-	if renterIP == "" {
-		renterIP = "10.99.0.2"
-	}
+		// 5. Attempt hole-punching if we have peer candidates
+		if len(exchResp.GetPeerCandidates()) > 0 {
+			remoteCandidates := make([]nat.Candidate, len(exchResp.PeerCandidates))
+			for i, c := range exchResp.PeerCandidates {
+				remoteCandidates[i] = nat.Candidate{
+					Address:  c.Address,
+					Type:     c.Type,
+					Priority: c.Priority,
+				}
+			}
 
-	confPath, err := WriteConfig(sess.Id, WGConfig{
-		PrivateKey:    kp.PrivateKey,
-		TunnelIP:      providerIP,
-		ListenPort:    wgPort,
-		PeerPublicKey: peerWGKey,
-		PeerIP:        renterIP,
-		PeerEndpoint:  peerEndpoint,
-	})
-	if err != nil {
-		d.log.Error("wireguard config failed", "session_id", sid, "error", err)
-	}
+			addr, err := nat.Probe(ctx, wgPort, remoteCandidates, 10*time.Second, d.log)
+			if err == nil {
+				peerEndpoint = addr
+				connMode = "holepunch"
+				d.log.Info("hole punch succeeded", "session_id", sid, "endpoint", addr)
+			} else if errors.Is(err, nat.ErrHolePunchFailed) {
+				d.log.Info("hole punch failed, falling back to relay", "session_id", sid)
+			}
+		}
 
-	// 7b. Auto-activate WireGuard tunnel (daemon typically runs with root privileges)
-	if confPath != "" {
-		rs.wgConfPath = confPath
-		if _, err := WGUp(ctx, confPath, d.log); err != nil {
-			d.log.Warn("wireguard auto-activation failed", "session_id", sid, "error", err)
+		// 6. Relay fallback
+		if connMode == "" && exchResp.GetRelayAddress() != "" {
+			proxyPort := wgPort + 10000 // offset to avoid collision
+			rc, err := relay.NewRelayClient(exchResp.RelayAddress, exchResp.RelayToken, proxyPort, wgPort, d.log)
+			if err != nil {
+				d.log.Error("relay client failed", "session_id", sid, "error", err)
+			} else {
+				relayCtx, cancel := context.WithCancel(ctx)
+				rs.relayCancel = cancel
+				go rc.Run(relayCtx)
+
+				peerEndpoint = fmt.Sprintf("127.0.0.1:%d", proxyPort)
+				connMode = "relay"
+
+				// Tell registry to activate relay
+				retry.Do(ctx, retry.DefaultConfig(), func(ctx context.Context) error {
+					_, err := d.client.ReportConnectionResult(ctx, &computev1.ReportConnectionResultRequest{
+						SessionId: sess.Id,
+						PeerId:    d.provider.Id,
+						UseRelay:  true,
+					})
+					return err
+				})
+
+				d.log.Info("relay active", "session_id", sid, "relay_addr", exchResp.RelayAddress)
+			}
+		}
+
+		if connMode == "" {
+			connMode = "direct"
+			peerEndpoint = ""
+		}
+
+		// 7. Write and activate WireGuard config.
+		providerIP := sess.GetWgProviderIp()
+		renterIP := sess.GetWgRenterIp()
+		if providerIP == "" {
+			providerIP = "10.99.0.1" // fallback for backward compat
+		}
+		if renterIP == "" {
+			renterIP = "10.99.0.2"
+		}
+
+		confPath, err := WriteConfig(sess.Id, WGConfig{
+			PrivateKey:    kp.PrivateKey,
+			TunnelIP:      providerIP,
+			ListenPort:    wgPort,
+			PeerPublicKey: peerWGKey,
+			PeerIP:        renterIP,
+			PeerEndpoint:  peerEndpoint,
+		})
+		if err != nil {
+			d.log.Error("wireguard config failed", "session_id", sid, "error", err)
+		}
+
+		if confPath != "" {
+			rs.wgConfPath = confPath
+			if _, err := WGUp(ctx, confPath, d.log); err != nil {
+				d.log.Warn("wireguard auto-activation failed", "session_id", sid, "error", err)
+				// Fall back to compatibility mode if WG cannot be activated.
+				connMode = "compat"
+			}
 		}
 	}
 
@@ -390,8 +415,11 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 
 	// 9. Report status to registry
 	sshEndpoint := fmt.Sprintf("%s:%s", d.cfg.Address, sshPort)
-	wgEndpoint := fmt.Sprintf("%s:%d", d.cfg.Address, wgPort)
-	d.updateStatus(ctx, sess.Id, "running", containerID, sshEndpoint)
+	wgEndpoint := ""
+	if connMode != "compat" {
+		wgEndpoint = fmt.Sprintf("%s:%d", d.cfg.Address, wgPort)
+	}
+	d.updateStatus(ctx, sess.Id, "running", containerID, sshEndpoint, wgEndpoint)
 
 	// Report connection result if holepunch
 	if connMode == "holepunch" {
@@ -437,15 +465,16 @@ func (d *Daemon) stopSession(ctx context.Context, sessionID string) {
 	}
 
 	RemoveConfig(sessionID)
-	d.updateStatus(ctx, sessionID, "terminated", "", "")
+	d.updateStatus(ctx, sessionID, "terminated", "", "", "")
 }
 
-func (d *Daemon) updateStatus(ctx context.Context, sessionID, status, containerID, sshEndpoint string) {
+func (d *Daemon) updateStatus(ctx context.Context, sessionID, status, containerID, sshEndpoint, wgEndpoint string) {
 	req := &computev1.UpdateSessionStatusRequest{
 		SessionId:   sessionID,
 		Status:      status,
 		ContainerId: containerID,
 		SshEndpoint: sshEndpoint,
+		WgEndpoint:  wgEndpoint,
 	}
 
 	err := retry.Do(ctx, retry.Config{

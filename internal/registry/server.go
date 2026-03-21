@@ -371,6 +371,13 @@ func (s *Server) UpdateSessionStatus(ctx context.Context, req *computev1.UpdateS
 	if req.WgEndpoint != "" {
 		rec.WGEndpoint = req.WgEndpoint
 	}
+	if req.Status == "running" {
+		if req.WgEndpoint == "" {
+			rec.ConnectionMode = "compat"
+		} else if rec.ConnectionMode == "" {
+			rec.ConnectionMode = "direct"
+		}
+	}
 
 	if err := s.plugins.Store.PutSession(ctx, rec); err != nil {
 		return nil, storeErr(err)
