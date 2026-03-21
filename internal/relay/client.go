@@ -13,7 +13,7 @@ import (
 // The client forwards packets bidirectionally, adding/stripping the relay header.
 type RelayClient struct {
 	relayAddr *net.UDPAddr
-	tokenHash []byte // 4-byte token hash
+	tokenID   []byte // 16-byte token identifier
 	proxyPort int    // local port WireGuard connects to
 	wgPort    int    // local WireGuard listen port to forward incoming packets to
 	log       *slog.Logger
@@ -30,7 +30,7 @@ func NewRelayClient(relayAddr string, token string, proxyPort, wgPort int, log *
 
 	return &RelayClient{
 		relayAddr: raddr,
-		tokenHash: TokenHashBytes(token),
+		tokenID:   TokenIDBytes(token),
 		proxyPort: proxyPort,
 		wgPort:    wgPort,
 		log:       log,
@@ -70,10 +70,14 @@ func (rc *RelayClient) Run(ctx context.Context) error {
 	// Track the WireGuard peer address (learned from first packet)
 	var wgPeer *net.UDPAddr
 
+	// Build relay header: magic (4) + tokenID (16) = 20 bytes
+	header := make([]byte, 0, headerLen)
+	header = append(header, relayMagic...)
+	header = append(header, rc.tokenID...)
+
 	// WireGuard -> Relay (outbound)
 	go func() {
 		buf := make([]byte, 65536)
-		header := append(relayMagic, rc.tokenHash...)
 
 		for {
 			proxyConn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -90,7 +94,7 @@ func (rc *RelayClient) Run(ctx context.Context) error {
 			wgPeer = raddr
 
 			// Prepend relay header and send to relay server
-			pkt := make([]byte, 0, 8+n)
+			pkt := make([]byte, 0, headerLen+n)
 			pkt = append(pkt, header...)
 			pkt = append(pkt, buf[:n]...)
 			relayConn.Write(pkt)
