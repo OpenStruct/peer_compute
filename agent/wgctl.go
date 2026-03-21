@@ -21,7 +21,10 @@ func WGUp(ctx context.Context, confPath string, log *slog.Logger) (string, error
 		return "", fmt.Errorf("wg-quick up requires root privileges")
 	}
 
-	cmd := exec.CommandContext(ctx, "wg-quick", "up", confPath)
+	cmd, err := wgQuickCommand(ctx, "up", confPath)
+	if err != nil {
+		return "", err
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("wg-quick up: %w: %s", err, strings.TrimSpace(string(output)))
@@ -39,12 +42,34 @@ func WGDown(ctx context.Context, confPath string, log *slog.Logger) error {
 		return fmt.Errorf("wg-quick down requires root privileges")
 	}
 
-	cmd := exec.CommandContext(ctx, "wg-quick", "down", confPath)
+	cmd, err := wgQuickCommand(ctx, "down", confPath)
+	if err != nil {
+		return err
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("wg-quick down: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func wgQuickCommand(ctx context.Context, action, confPath string) (*exec.Cmd, error) {
+	wgQuickPath, err := exec.LookPath("wg-quick")
+	if err != nil {
+		return nil, fmt.Errorf("wg-quick not found: %w", err)
+	}
+
+	// On macOS, wg-quick can require Bash 4+, while /bin/bash is 3.x.
+	// Prefer Homebrew bash when present and invoke the script through it.
+	if runtime.GOOS == "darwin" {
+		for _, bashPath := range []string{"/opt/homebrew/bin/bash", "/usr/local/bin/bash"} {
+			if _, err := os.Stat(bashPath); err == nil {
+				return exec.CommandContext(ctx, bashPath, wgQuickPath, action, confPath), nil
+			}
+		}
+	}
+
+	return exec.CommandContext(ctx, wgQuickPath, action, confPath), nil
 }
 
 // HasWGQuick checks whether wg-quick is available on PATH.
