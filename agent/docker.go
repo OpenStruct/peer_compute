@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -84,15 +85,19 @@ func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string,
 		return "", "", fmt.Errorf("container start: %w", err)
 	}
 
-	// Get the assigned host port
-	inspect, err := cr.cli.ContainerInspect(ctx, resp.ID)
-	if err != nil {
-		return resp.ID, "", fmt.Errorf("container inspect: %w", err)
-	}
-
-	bindings := inspect.NetworkSettings.Ports["22/tcp"]
-	if len(bindings) > 0 {
-		sshPort = bindings[0].HostPort
+	// Get the assigned host port. Docker can take a brief moment to publish
+	// the mapping after container start.
+	for i := 0; i < 20; i++ {
+		inspect, err := cr.cli.ContainerInspect(ctx, resp.ID)
+		if err != nil {
+			return resp.ID, "", fmt.Errorf("container inspect: %w", err)
+		}
+		bindings := inspect.NetworkSettings.Ports["22/tcp"]
+		if len(bindings) > 0 && bindings[0].HostPort != "" {
+			sshPort = bindings[0].HostPort
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	cr.log.Info("started container", "container_id", resp.ID[:12], "ssh_port", sshPort)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -414,7 +415,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	d.mu.Unlock()
 
 	// 9. Report status to registry
-	sshEndpoint := fmt.Sprintf("%s:%s", d.cfg.Address, sshPort)
+	sshEndpoint := buildSSHEndpoint(d.cfg.Address, sshPort)
 	wgEndpoint := ""
 	if connMode != "compat" {
 		wgEndpoint = fmt.Sprintf("%s:%d", d.cfg.Address, wgPort)
@@ -435,6 +436,21 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 
 	d.log.Info("session running", "session_id", sid, "mode", connMode,
 		"container", containerID[:12], "ssh", sshEndpoint, "wg", wgEndpoint)
+}
+
+func buildSSHEndpoint(advertisedAddr, sshPort string) string {
+	if sshPort == "" {
+		return ""
+	}
+
+	host := strings.TrimSpace(advertisedAddr)
+	if h, _, err := net.SplitHostPort(host); err == nil && h != "" {
+		host = h
+	}
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, sshPort)
 }
 
 func (d *Daemon) stopSession(ctx context.Context, sessionID string) {

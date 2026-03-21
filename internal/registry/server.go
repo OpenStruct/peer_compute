@@ -205,8 +205,21 @@ func (s *Server) Heartbeat(ctx context.Context, req *computev1.HeartbeatRequest)
 	if err := s.plugins.Store.PutProvider(ctx, rec); err != nil {
 		return nil, storeErr(err)
 	}
+	resp := &computev1.HeartbeatResponse{Acknowledged: true}
+	for _, sid := range req.ActiveSessions {
+		sess, err := s.plugins.Store.GetSessionByPrefix(ctx, sid)
+		if err != nil {
+			continue
+		}
+		if sess.ProviderID != rec.ID {
+			continue
+		}
+		if sess.Status == "terminated" {
+			resp.TerminateSessions = append(resp.TerminateSessions, sess.ID)
+		}
+	}
 
-	return &computev1.HeartbeatResponse{Acknowledged: true}, nil
+	return resp, nil
 }
 
 func (s *Server) ListProviders(ctx context.Context, req *computev1.ListProvidersRequest) (*computev1.ListProvidersResponse, error) {

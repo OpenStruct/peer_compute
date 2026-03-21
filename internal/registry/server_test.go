@@ -252,6 +252,33 @@ func TestHeartbeat(t *testing.T) {
 	if !resp.Acknowledged {
 		t.Error("Heartbeat not acknowledged")
 	}
+
+	created, err := s.CreateSession(ctx, &computev1.CreateSessionRequest{
+		ProviderId:  reg.Provider.Id,
+		RenterId:    "renter-1",
+		Image:       "ubuntu:22.04",
+		WgPublicKey: "renter-pk",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_, err = s.TerminateSession(ctx, &computev1.TerminateSessionRequest{
+		SessionId: created.Session.Id,
+	})
+	if err != nil {
+		t.Fatalf("TerminateSession: %v", err)
+	}
+
+	resp, err = s.Heartbeat(ctx, &computev1.HeartbeatRequest{
+		ProviderId:     reg.Provider.Id,
+		ActiveSessions: []string{created.Session.Id},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat with active sessions: %v", err)
+	}
+	if len(resp.TerminateSessions) != 1 || resp.TerminateSessions[0] != created.Session.Id {
+		t.Fatalf("terminate sessions = %v, want [%s]", resp.TerminateSessions, created.Session.Id)
+	}
 }
 
 func TestListProviders(t *testing.T) {
