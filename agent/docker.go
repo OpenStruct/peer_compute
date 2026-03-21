@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -14,6 +16,20 @@ import (
 
 	computev1 "github.com/OpenStruct/peer_compute/gen/compute/v1"
 )
+
+// debianSSHBootstrap installs OpenSSH if missing and runs sshd in the foreground.
+// Vanilla ubuntu:/debian: images default to a shell that exits immediately when run
+// non-interactively; sessions require a long-running process and something listening on 22/tcp.
+const debianSSHBootstrap = `set -e
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v sshd >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y -qq openssh-server
+fi
+mkdir -p /var/run/sshd
+echo "root:$PEER_COMPUTE_SESSION_ROOT_PASSWORD" | chpasswd
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+exec /usr/sbin/sshd -D -e`
 
 // ContainerRunner manages Docker containers for compute sessions.
 type ContainerRunner struct {
@@ -70,6 +86,15 @@ func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string,
 			"peer-compute.session": sessionID,
 		},
 	}
+	if cmd := sessionContainerCmd(imageName); cmd != nil {
+		containerCfg.Cmd = cmd
+		pw := os.Getenv("PEER_COMPUTE_SESSION_ROOT_PASSWORD")
+		if pw == "" {
+			pw = "peercompute"
+		}
+		containerCfg.Env = []string{"PEER_COMPUTE_SESSION_ROOT_PASSWORD=" + pw}
+		cr.log.Debug("using session container command override", "image", imageName)
+	}
 
 	hostCfg := &container.HostConfig{
 		Resources: container.Resources{
@@ -100,7 +125,7 @@ func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string,
 			return resp.ID, "", fmt.Errorf("container inspect: %w", err)
 		}
 		if inspect.State != nil && !inspect.State.Running {
-			return resp.ID, "", fmt.Errorf("container exited during startup (status=%s, exit_code=%d)", inspect.State.Status, inspect.State.ExitCode)
+			return resp.ID, "", containerStartExitErr(inspect.State.Status, inspect.State.ExitCode)
 		}
 		bindings := inspect.NetworkSettings.Ports["22/tcp"]
 		if len(bindings) > 0 && bindings[0].HostPort != "" {
@@ -112,6 +137,27 @@ func (cr *ContainerRunner) StartContainer(ctx context.Context, sessionID string,
 
 	cr.log.Info("started container", "container_id", resp.ID[:12], "ssh_port", sshPort)
 	return resp.ID, sshPort, nil
+}
+
+// sessionContainerCmd returns a Debian/Ubuntu bootstrap command so plain ubuntu:* images
+// stay up and run sshd. Set PEER_COMPUTE_SKIP_SSH_BOOTSTRAP=1 to use the image CMD only.
+func sessionContainerCmd(imageName string) []string {
+	if strings.TrimSpace(os.Getenv("PEER_COMPUTE_SKIP_SSH_BOOTSTRAP")) != "" {
+		return nil
+	}
+	s := strings.ToLower(imageName)
+	if !strings.Contains(s, "ubuntu") && !strings.Contains(s, "debian") {
+		return nil
+	}
+	return []string{"/bin/bash", "-c", debianSSHBootstrap}
+}
+
+func containerStartExitErr(status string, exitCode int) error {
+	return fmt.Errorf("container exited during startup (status=%s, exit_code=%d): "+
+		"the image must keep running and listen on TCP 22 for SSH. "+
+		"Official ubuntu/debian images often exit immediately (default shell, no sshd). "+
+		"For ubuntu/debian we bootstrap OpenSSH unless PEER_COMPUTE_SKIP_SSH_BOOTSTRAP=1; "+
+		"otherwise use an image that runs sshd, or set a blocking CMD", status, exitCode)
 }
 
 // StopContainer stops and removes a container.
