@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +11,24 @@ import (
 	"sync"
 	"time"
 )
+
+const (
+	// RawBasePort is the first UDP port in the raw-WireGuard relay range.
+	// Each session gets a deterministic port in [RawBasePort, RawBasePort+RawPortRange).
+	// These ports must be reachable by renters (open in firewall / exposed in docker-compose).
+	RawBasePort  = 44000
+	RawPortRange = 1000
+)
+
+// RawPortForToken returns the deterministic raw UDP port for the given relay
+// token. The same formula is used by the relay server (to bind) and by the
+// pro API (to build the WireGuard Endpoint line), so they always agree without
+// any extra RPC.
+func RawPortForToken(token string) int {
+	h := sha256.Sum256([]byte(token))
+	offset := int(binary.BigEndian.Uint32(h[:4]) % uint32(RawPortRange))
+	return RawBasePort + offset
+}
 
 var relayMagic = []byte("PCRL") // Peer Compute ReLay
 
@@ -42,12 +61,14 @@ type RelayServer struct {
 }
 
 type relaySession struct {
-	sessionID string
-	token     string
-	tokenID   [tokenIDLen]byte // first 16 bytes of SHA-256(token)
-	peerA     *net.UDPAddr     // first peer to send a packet
-	peerB     *net.UDPAddr     // second peer
-	created   time.Time
+	sessionID  string
+	token      string
+	tokenID    [tokenIDLen]byte // first 16 bytes of SHA-256(token)
+	peerA      *net.UDPAddr     // provider relay client (on main conn)
+	peerB      *net.UDPAddr     // legacy: second relay client (pcp-renter)
+	rawConn    *net.UDPConn     // per-session raw UDP listener for plain WireGuard renters
+	renterAddr *net.UDPAddr     // renter's address on rawConn (set on first raw packet)
+	created    time.Time
 	lastActive time.Time
 }
 
@@ -65,25 +86,89 @@ func (rs *RelayServer) Addr() string {
 }
 
 // RegisterSession activates relaying for a session with the given token.
+// It also binds a per-session raw UDP port so plain WireGuard clients (renters
+// using the downloaded .conf file) can connect without the pcp-renter binary.
+// The raw port is deterministic — use RawPortForToken(token) to obtain it.
 func (rs *RelayServer) RegisterSession(token, sessionID string) {
 	now := time.Now()
-	rs.mu.Lock()
-	rs.sessions[token] = &relaySession{
+	sess := &relaySession{
 		sessionID:  sessionID,
 		token:      token,
 		tokenID:    tokenID(token),
 		created:    now,
 		lastActive: now,
 	}
+
+	// Bind the raw WireGuard port for this session.
+	rawPort := RawPortForToken(token)
+	rawConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: rawPort})
+	if err != nil {
+		rs.log.Warn("raw relay port unavailable, WireGuard .conf endpoint will be empty",
+			"session_id", sessionID[:8], "port", rawPort, "error", err)
+	} else {
+		sess.rawConn = rawConn
+		rs.log.Info("relay session registered",
+			"session_id", sessionID[:8], "raw_port", rawPort)
+		go rs.serveRaw(rawConn, sess)
+	}
+
+	rs.mu.Lock()
+	rs.sessions[token] = sess
 	rs.mu.Unlock()
-	rs.log.Info("relay session registered", "session_id", sessionID[:8])
+
+	if err != nil {
+		rs.log.Info("relay session registered (no raw port)", "session_id", sessionID[:8])
+	}
+}
+
+// serveRaw handles raw WireGuard UDP packets from renters on the per-session
+// port. No PCRL header is expected — the port itself identifies the session.
+// Inbound packets are wrapped with the PCRL header and forwarded to the
+// provider's relay client (peerA) on the main relay conn.
+// Outbound packets from peerA are forwarded back to renterAddr (set below in
+// the main serve loop).
+func (rs *RelayServer) serveRaw(conn *net.UDPConn, sess *relaySession) {
+	defer conn.Close()
+	buf := make([]byte, 65536)
+	hdr := make([]byte, headerLen)
+	copy(hdr[:4], relayMagic)
+	copy(hdr[4:], sess.tokenID[:])
+
+	for {
+		n, raddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return // conn closed on session removal
+		}
+		sess.lastActive = time.Now()
+
+		// Record the renter's address so the main loop can forward replies back.
+		rs.mu.Lock()
+		sess.renterAddr = raddr
+		rs.mu.Unlock()
+
+		// Forward to provider relay client with PCRL header.
+		rs.mu.RLock()
+		peerA := sess.peerA
+		rs.mu.RUnlock()
+		if peerA == nil {
+			continue // provider hasn't connected yet; drop and wait
+		}
+		pkt := make([]byte, headerLen+n)
+		copy(pkt, hdr)
+		copy(pkt[headerLen:], buf[:n])
+		rs.conn.WriteToUDP(pkt, peerA) //nolint:errcheck
+	}
 }
 
 // RemoveSession deactivates relaying for a token.
 func (rs *RelayServer) RemoveSession(token string) {
 	rs.mu.Lock()
+	sess := rs.sessions[token]
 	delete(rs.sessions, token)
 	rs.mu.Unlock()
+	if sess != nil && sess.rawConn != nil {
+		sess.rawConn.Close()
+	}
 }
 
 // InvalidateSession immediately terminates a relay session, refusing to
@@ -97,6 +182,9 @@ func (rs *RelayServer) InvalidateSession(token string) {
 	rs.mu.Unlock()
 
 	if ok {
+		if sess.rawConn != nil {
+			sess.rawConn.Close()
+		}
 		rs.log.Info("relay session invalidated",
 			"session_id", sess.sessionID[:min(8, len(sess.sessionID))])
 	}
@@ -188,23 +276,35 @@ func (rs *RelayServer) serve(ctx context.Context, conn *net.UDPConn) error {
 		}
 
 		// Determine if we need to assign a peer (write path) or just forward (read path).
+		// needsWrite is false once peerA is set AND at least one return path exists
+		// (peerB for the legacy relay client, or renterAddr for the raw WireGuard path).
 		needsWrite := sess.peerA == nil ||
-			(sess.peerB == nil && raddr.String() != sess.peerA.String())
+			(sess.peerB == nil && sess.renterAddr == nil && raddr.String() != sess.peerA.String())
 
 		if !needsWrite {
 			// Pure forwarding — hot path under RLock only.
 			var target *net.UDPAddr
+			var rawFwd *net.UDPConn  // non-nil when forwarding via per-session raw port
+			var rawDst *net.UDPAddr
 			switch {
 			case raddr.String() == sess.peerA.String():
-				target = sess.peerB
-			case raddr.String() == sess.peerB.String():
+				// Provider → renter: prefer raw path (plain WireGuard) if available.
+				if sess.rawConn != nil && sess.renterAddr != nil {
+					rawFwd = sess.rawConn
+					rawDst = sess.renterAddr
+				} else {
+					target = sess.peerB
+				}
+			case sess.peerB != nil && raddr.String() == sess.peerB.String():
 				target = sess.peerA
 			}
 			sess.lastActive = time.Now()
 			rs.mu.RUnlock()
 
-			if target != nil {
-				conn.WriteToUDP(payload, target)
+			if rawFwd != nil {
+				rawFwd.WriteToUDP(payload, rawDst) //nolint:errcheck
+			} else if target != nil {
+				conn.WriteToUDP(payload, target) //nolint:errcheck
 			}
 			continue
 		}
@@ -220,18 +320,26 @@ func (rs *RelayServer) serve(ctx context.Context, conn *net.UDPConn) error {
 		}
 
 		var target *net.UDPAddr
+		var rawFwd *net.UDPConn // non-nil when forwarding via per-session raw port
+		var rawDst *net.UDPAddr
 		switch {
 		case sess.peerA == nil:
 			sess.peerA = raddr
 			sess.lastActive = time.Now()
 			rs.mu.Unlock()
 			continue // no peer to forward to yet
-		case sess.peerB == nil && raddr.String() != sess.peerA.String():
+		case sess.peerB == nil && sess.renterAddr == nil && raddr.String() != sess.peerA.String():
 			sess.peerB = raddr
 			target = sess.peerA
 		case raddr.String() == sess.peerA.String():
-			target = sess.peerB
-		case raddr.String() == sess.peerB.String():
+			// Provider → renter: prefer raw path (plain WireGuard) if available.
+			if sess.rawConn != nil && sess.renterAddr != nil {
+				rawFwd = sess.rawConn
+				rawDst = sess.renterAddr
+			} else {
+				target = sess.peerB
+			}
+		case sess.peerB != nil && raddr.String() == sess.peerB.String():
 			target = sess.peerA
 		default:
 			rs.mu.Unlock()
@@ -240,8 +348,10 @@ func (rs *RelayServer) serve(ctx context.Context, conn *net.UDPConn) error {
 		sess.lastActive = time.Now()
 		rs.mu.Unlock()
 
-		if target != nil {
-			conn.WriteToUDP(payload, target)
+		if rawFwd != nil {
+			rawFwd.WriteToUDP(payload, rawDst) //nolint:errcheck
+		} else if target != nil {
+			conn.WriteToUDP(payload, target) //nolint:errcheck
 		}
 	}
 }
@@ -276,6 +386,9 @@ func (rs *RelayServer) reapIdleSessions(ctx context.Context) {
 						"session_id", sess.sessionID[:8],
 						"idle", now.Sub(sess.lastActive).Round(time.Second))
 					delete(rs.sessions, token)
+					if sess.rawConn != nil {
+						sess.rawConn.Close()
+					}
 				}
 			}
 			rs.mu.Unlock()
