@@ -548,10 +548,11 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	proxyCtx, proxyCancel := context.WithCancel(ctx)
 	d.mu.Lock()
 	if current, ok := d.sessions[sess.Id]; ok {
+		oldCancel := current.relayCancel // capture before overwrite to avoid self-recursion
 		current.relayCancel = func() {
 			proxyCancel()
-			if rs.relayCancel != nil {
-				rs.relayCancel()
+			if oldCancel != nil {
+				oldCancel()
 			}
 		}
 	}
