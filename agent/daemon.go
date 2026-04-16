@@ -383,7 +383,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	if err != nil {
 		d.log.Error("container start failed", "session_id", sid, "error", err)
 		cleanupFailedStart()
-		d.updateStatus(ctx, sess.Id, "terminated", "", "", "")
+		d.updateStatus(ctx, sess.Id, "terminated", "", "", "", "")
 		return
 	}
 	rs.containerID = containerID
@@ -394,7 +394,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	if err != nil {
 		d.log.Error("keygen failed", "session_id", sid, "error", err)
 		cleanupFailedStart()
-		d.updateStatus(ctx, sess.Id, "terminated", "", "", "")
+		d.updateStatus(ctx, sess.Id, "terminated", "", "", "", "")
 		return
 	}
 	rs.wgKeyPair = kp
@@ -410,7 +410,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	failSessionStart := func(err error) {
 		d.log.Error("session startup failed", "session_id", sid, "error", err)
 		cleanupFailedStart()
-		d.updateStatus(ctx, sess.Id, "terminated", "", "", "")
+		d.updateStatus(ctx, sess.Id, "terminated", "", "", "", "")
 	}
 
 	if d.compat {
@@ -542,10 +542,30 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	}
 	d.mu.Unlock()
 
-	// 9. Report status to registry
+	// 9. Start an in-process SSH proxy: providerWGIP:22 → localhost:sshPort.
+	// This lets renters reach the container via the WireGuard tunnel without
+	// any OS-level port forwarding (pfctl/iptables).
+	proxyCtx, proxyCancel := context.WithCancel(ctx)
+	d.mu.Lock()
+	if current, ok := d.sessions[sess.Id]; ok {
+		current.relayCancel = func() {
+			proxyCancel()
+			if rs.relayCancel != nil {
+				rs.relayCancel()
+			}
+		}
+	}
+	d.mu.Unlock()
+	providerWGIP := sess.GetWgProviderIp()
+	if providerWGIP == "" {
+		providerWGIP = "10.99.0.1"
+	}
+	go runSSHProxy(proxyCtx, providerWGIP, sshPort, d.log)
+
+	// 10. Report status to registry
 	sshEndpoint := buildSSHEndpoint(d.cfg.Address, sshPort)
 	wgEndpoint := fmt.Sprintf("%s:%d", d.cfg.Address, wgPort)
-	d.updateStatus(ctx, sess.Id, "running", containerID, sshEndpoint, wgEndpoint)
+	d.updateStatus(ctx, sess.Id, "running", containerID, sshEndpoint, wgEndpoint, kp.PublicKey)
 
 	// Report connection result if holepunch
 	if connMode == "holepunch" {
@@ -606,16 +626,17 @@ func (d *Daemon) stopSession(ctx context.Context, sessionID string) {
 	}
 
 	RemoveConfig(sessionID)
-	d.updateStatus(ctx, sessionID, "terminated", "", "", "")
+	d.updateStatus(ctx, sessionID, "terminated", "", "", "", "")
 }
 
-func (d *Daemon) updateStatus(ctx context.Context, sessionID, status, containerID, sshEndpoint, wgEndpoint string) {
+func (d *Daemon) updateStatus(ctx context.Context, sessionID, status, containerID, sshEndpoint, wgEndpoint, wgPublicKey string) {
 	req := &computev1.UpdateSessionStatusRequest{
 		SessionId:   sessionID,
 		Status:      status,
 		ContainerId: containerID,
 		SshEndpoint: sshEndpoint,
 		WgEndpoint:  wgEndpoint,
+		WgPublicKey: wgPublicKey,
 	}
 
 	err := retry.Do(ctx, retry.Config{
