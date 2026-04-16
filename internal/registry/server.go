@@ -222,6 +222,22 @@ func providerIDFromMetadata(ctx context.Context) string {
 	return vals[0]
 }
 
+func sessionPolicyFromMetadata(ctx context.Context) (securityTier, networkPolicy string) {
+	securityTier = "sensitive"
+	networkPolicy = "wireguard_required"
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return securityTier, networkPolicy
+	}
+	if vals := md.Get("x-security-tier"); len(vals) > 0 && vals[0] != "" {
+		securityTier = vals[0]
+	}
+	if vals := md.Get("x-network-policy"); len(vals) > 0 && vals[0] != "" {
+		networkPolicy = vals[0]
+	}
+	return securityTier, networkPolicy
+}
+
 func (s *Server) RegisterProvider(ctx context.Context, req *computev1.RegisterProviderRequest) (*computev1.RegisterProviderResponse, error) {
 	now := time.Now().Unix()
 
@@ -370,6 +386,11 @@ func (s *Server) ListProviders(ctx context.Context, req *computev1.ListProviders
 }
 
 func (s *Server) CreateSession(ctx context.Context, req *computev1.CreateSessionRequest) (*computev1.CreateSessionResponse, error) {
+	securityTier, networkPolicy := sessionPolicyFromMetadata(ctx)
+	if networkPolicy == "wireguard_required" && req.GetWgPublicKey() == "" {
+		return nil, status.Error(codes.InvalidArgument, "wireguard_required: renter wg_public_key is required")
+	}
+
 	pRec, err := s.plugins.Store.GetProviderByPrefix(ctx, req.ProviderId)
 	if err != nil {
 		return nil, storeErr(err)
@@ -393,15 +414,16 @@ func (s *Server) CreateSession(ctx context.Context, req *computev1.CreateSession
 	}
 
 	rec := &plugin.SessionRecord{
-		ID:           sessionID,
-		ProviderID:   pRec.ID,
-		RenterID:     req.RenterId,
-		Image:        req.Image,
-		Status:       "pending",
-		RelayToken:   relayToken,
-		WGProviderIP: providerIP,
-		WGRenterIP:   renterIP,
-		CreatedAt:    time.Now().Unix(),
+		ID:             sessionID,
+		ProviderID:     pRec.ID,
+		RenterID:       req.RenterId,
+		Image:          req.Image,
+		Status:         "pending",
+		ConnectionMode: "", // set by agent as direct|holepunch|relay once WG is active
+		RelayToken:     relayToken,
+		WGProviderIP:   providerIP,
+		WGRenterIP:     renterIP,
+		CreatedAt:      time.Now().Unix(),
 	}
 	if req.Requested != nil {
 		rec.CPUCores = req.Requested.CpuCores
@@ -423,6 +445,8 @@ func (s *Server) CreateSession(ctx context.Context, req *computev1.CreateSession
 		}
 		s.mu.Unlock()
 	}
+
+	_ = securityTier // retained for future tiered enforcement hooks
 
 	return &computev1.CreateSessionResponse{Session: sessionToProto(rec)}, nil
 }
@@ -509,8 +533,9 @@ func (s *Server) UpdateSessionStatus(ctx context.Context, req *computev1.UpdateS
 	}
 	if req.Status == "running" {
 		if req.WgEndpoint == "" {
-			rec.ConnectionMode = "compat"
-		} else if rec.ConnectionMode == "" {
+			return nil, status.Error(codes.FailedPrecondition, "wireguard_required: running sessions must include wg_endpoint")
+		}
+		if rec.ConnectionMode == "" {
 			rec.ConnectionMode = "direct"
 		}
 	}

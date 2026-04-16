@@ -149,11 +149,12 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 	compat := false
 	modeNote := ""
 	if !HasWGQuick() {
-		compat = true
-		modeNote = "wg-quick not found"
-	} else if !IsRoot() {
-		compat = true
-		modeNote = "insufficient privileges for wg-quick"
+		runner.Close()
+		return nil, fmt.Errorf("wireguard is required: wg-quick not found")
+	}
+	if !IsRoot() {
+		runner.Close()
+		return nil, fmt.Errorf("wireguard is required: run agent with privileges for wg-quick")
 	}
 
 	return &Daemon{
@@ -406,8 +407,15 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 	var peerEndpoint string
 	var connMode string
 
+	failSessionStart := func(err error) {
+		d.log.Error("session startup failed", "session_id", sid, "error", err)
+		cleanupFailedStart()
+		d.updateStatus(ctx, sess.Id, "terminated", "", "", "")
+	}
+
 	if d.compat {
-		connMode = "compat"
+		failSessionStart(errors.New("wireguard strict mode enabled; compatibility transport disabled"))
+		return
 	} else {
 		// 3. Gather endpoint candidates (local + STUN)
 		candidates, err := nat.GatherCandidates(ctx, d.cfg.STUNAddr, wgPort, d.log)
@@ -439,10 +447,8 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 
 		peerWGKey := exchResp.GetPeerWgPublicKey()
 		if peerWGKey == "" {
-			// Web renters currently don't establish WireGuard keys yet.
-			// Avoid generating invalid configs and run in compatibility mode.
-			connMode = "compat"
-			d.log.Info("peer wireguard key missing, forcing compatibility mode", "session_id", sid)
+			failSessionStart(errors.New("wireguard_required: peer wireguard key missing"))
+			return
 		}
 
 		// 5. Attempt hole-punching if we have peer candidates
@@ -500,36 +506,32 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 		}
 
 		// 7. Write and activate WireGuard config.
-		if connMode != "compat" {
-			providerIP := sess.GetWgProviderIp()
-			renterIP := sess.GetWgRenterIp()
-			if providerIP == "" {
-				providerIP = "10.99.0.1" // fallback for backward compat
-			}
-			if renterIP == "" {
-				renterIP = "10.99.0.2"
-			}
+		providerIP := sess.GetWgProviderIp()
+		renterIP := sess.GetWgRenterIp()
+		if providerIP == "" {
+			providerIP = "10.99.0.1" // fallback for legacy sessions
+		}
+		if renterIP == "" {
+			renterIP = "10.99.0.2"
+		}
 
-			confPath, err := WriteConfig(sess.Id, WGConfig{
-				PrivateKey:    kp.PrivateKey,
-				TunnelIP:      providerIP,
-				ListenPort:    wgPort,
-				PeerPublicKey: peerWGKey,
-				PeerIP:        renterIP,
-				PeerEndpoint:  peerEndpoint,
-			})
-			if err != nil {
-				d.log.Error("wireguard config failed", "session_id", sid, "error", err)
-			}
+		confPath, err := WriteConfig(sess.Id, WGConfig{
+			PrivateKey:    kp.PrivateKey,
+			TunnelIP:      providerIP,
+			ListenPort:    wgPort,
+			PeerPublicKey: peerWGKey,
+			PeerIP:        renterIP,
+			PeerEndpoint:  peerEndpoint,
+		})
+		if err != nil {
+			failSessionStart(fmt.Errorf("wireguard config failed: %w", err))
+			return
+		}
 
-			if confPath != "" {
-				rs.wgConfPath = confPath
-				if _, err := WGUp(ctx, confPath, d.log); err != nil {
-					d.log.Warn("wireguard auto-activation failed", "session_id", sid, "error", err)
-					// Fall back to compatibility mode if WG cannot be activated.
-					connMode = "compat"
-				}
-			}
+		rs.wgConfPath = confPath
+		if _, err := WGUp(ctx, confPath, d.log); err != nil {
+			failSessionStart(fmt.Errorf("wireguard activation failed: %w", err))
+			return
 		}
 	}
 
@@ -542,10 +544,7 @@ func (d *Daemon) startSession(ctx context.Context, sess *computev1.Session) {
 
 	// 9. Report status to registry
 	sshEndpoint := buildSSHEndpoint(d.cfg.Address, sshPort)
-	wgEndpoint := ""
-	if connMode != "compat" {
-		wgEndpoint = fmt.Sprintf("%s:%d", d.cfg.Address, wgPort)
-	}
+	wgEndpoint := fmt.Sprintf("%s:%d", d.cfg.Address, wgPort)
 	d.updateStatus(ctx, sess.Id, "running", containerID, sshEndpoint, wgEndpoint)
 
 	// Report connection result if holepunch

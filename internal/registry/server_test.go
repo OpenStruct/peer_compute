@@ -418,9 +418,10 @@ func TestHeartbeat_BatchTermination(t *testing.T) {
 	var terminatedIDs []string
 	for i := 0; i < 3; i++ {
 		created, err := s.CreateSession(ctx, &computev1.CreateSessionRequest{
-			ProviderId: providerID,
-			RenterId:   fmt.Sprintf("renter-%d", i),
-			Image:      "ubuntu:22.04",
+			ProviderId:  providerID,
+			RenterId:    fmt.Sprintf("renter-%d", i),
+			Image:       "ubuntu:22.04",
+			WgPublicKey: fmt.Sprintf("renter-pk-%d", i),
 			Requested: &computev1.Resources{
 				CpuCores: 1,
 				MemoryMb: 1024,
@@ -532,6 +533,39 @@ func TestCreateSession(t *testing.T) {
 	}
 	if resp.Session.Status != "pending" {
 		t.Errorf("status = %q, want pending", resp.Session.Status)
+	}
+}
+
+func TestCreateSession_RequiresWgPublicKey(t *testing.T) {
+	s := newTestServer()
+	ctx := context.Background()
+	reg, err := s.RegisterProvider(ctx, &computev1.RegisterProviderRequest{
+		Name:    "cs-wg-required",
+		Address: "1.1.1.1:5000",
+		Capacity: &computev1.Resources{
+			CpuCores: 2,
+			MemoryMb: 4096,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterProvider: %v", err)
+	}
+
+	_, err = s.CreateSession(ctx, &computev1.CreateSessionRequest{
+		ProviderId: reg.Provider.Id,
+	})
+	if err == nil {
+		t.Fatal("expected error when wg public key is missing")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status error, got %v", err)
+	}
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument", st.Code())
+	}
+	if got := st.Message(); got != "wireguard_required: renter wg_public_key is required" {
+		t.Fatalf("message = %q", got)
 	}
 }
 
