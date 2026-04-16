@@ -30,6 +30,13 @@ type RegistryConfig struct {
 	// RelayPort is the UDP port for the relay server (default: 3479).
 	RelayPort string
 
+	// RelayPublicAddr is the externally-reachable address advertised to agents.
+	// Required when running behind Docker or NAT where the bind port differs
+	// from the public port. Example: "compute.example.com:42024"
+	// If empty, the bind address (":RelayPort") is used, which only works when
+	// agents can reach the server on that exact address.
+	RelayPublicAddr string
+
 	// Plugins provides custom implementations for auth, reputation, and storage.
 	// If nil, open-source defaults are used.
 	Plugins *plugin.Bundle
@@ -54,6 +61,9 @@ func Registry(ctx context.Context, cfg RegistryConfig) error {
 
 	// Start relay server
 	relaySrv := relay.NewRelayServer(":"+cfg.RelayPort, log.With("sub", "relay"))
+	if cfg.RelayPublicAddr != "" {
+		relaySrv.SetPublicAddr(cfg.RelayPublicAddr)
+	}
 	go func() {
 		if err := relaySrv.Run(ctx); err != nil {
 			log.Error("relay server error", "error", err)

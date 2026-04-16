@@ -53,11 +53,12 @@ const (
 // cannot establish a direct connection (symmetric NAT). Both peers
 // send WireGuard UDP traffic here; the server forwards it to the other side.
 type RelayServer struct {
-	mu       sync.RWMutex
-	sessions map[string]*relaySession // full token -> session
-	conn     *net.UDPConn
-	addr     string
-	log      *slog.Logger
+	mu         sync.RWMutex
+	sessions   map[string]*relaySession // full token -> session
+	conn       *net.UDPConn
+	addr       string
+	publicAddr string // public address advertised to agents; overrides addr when set
+	log        *slog.Logger
 }
 
 type relaySession struct {
@@ -80,9 +81,22 @@ func NewRelayServer(listenAddr string, log *slog.Logger) *RelayServer {
 	}
 }
 
-// Addr returns the relay's listen address.
+// Addr returns the address advertised to agents. When SetPublicAddr has been
+// called (e.g. to expose the Docker-mapped port), that value is returned;
+// otherwise the bind address is returned.
 func (rs *RelayServer) Addr() string {
+	if rs.publicAddr != "" {
+		return rs.publicAddr
+	}
 	return rs.addr
+}
+
+// SetPublicAddr sets the public address advertised to agents. Call this when
+// the relay server is behind a NAT or Docker port mapping so that agents
+// receive the externally-reachable address instead of the internal bind address.
+// Example: "compute.example.com:42024"
+func (rs *RelayServer) SetPublicAddr(addr string) {
+	rs.publicAddr = addr
 }
 
 // RegisterSession activates relaying for a session with the given token.
