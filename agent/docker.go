@@ -79,6 +79,8 @@ func (cr *ContainerRunner) Ping(ctx context.Context) error {
 // Inter-container communication is disabled to prevent cross-session traffic.
 func (cr *ContainerRunner) createSessionNetwork(ctx context.Context, sessionID string) (string, error) {
 	networkName := "pcp-" + sessionID[:12]
+	// Remove any stale network left by a previous failed attempt (ignore errors).
+	_ = cr.cli.NetworkRemove(ctx, networkName)
 	resp, err := cr.cli.NetworkCreate(ctx, networkName, network.CreateOptions{
 		Driver: "bridge",
 		Options: map[string]string{

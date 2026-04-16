@@ -92,3 +92,19 @@ func ifaceFromPath(confPath string) string {
 	base := filepath.Base(confPath)
 	return strings.TrimSuffix(base, ".conf")
 }
+
+// CleanupStaleInterfaces brings down any leftover peer-compute WireGuard
+// interfaces from a previous run. Called at daemon startup to recover from
+// crashes that skipped normal session teardown.
+func CleanupStaleInterfaces(ctx context.Context, log *slog.Logger) {
+	dir := filepath.Join(os.TempDir(), "peer-compute", "wg")
+	entries, err := filepath.Glob(filepath.Join(dir, "pc-*.conf"))
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	for _, confPath := range entries {
+		log.Info("cleaning up stale wireguard interface", "conf", filepath.Base(confPath))
+		_ = WGDown(ctx, confPath, log)
+		_ = os.Remove(confPath)
+	}
+}

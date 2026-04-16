@@ -169,6 +169,9 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// Clean up any stale WireGuard interfaces left by a previous crash.
+	CleanupStaleInterfaces(ctx, d.log)
+
 	if err := d.register(ctx); err != nil {
 		return err
 	}
